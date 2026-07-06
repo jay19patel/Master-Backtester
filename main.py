@@ -3,6 +3,7 @@
 from data_fetcher import DataFetcher
 from indicator_engine import IndicatorEngine
 from oracle_labeler import OracleLabeler
+from relevance_analyzer import RelevanceAnalyzer
 
 SYMBOL = "ADAUSD"
 INTERVAL = "15m"
@@ -62,6 +63,7 @@ def print_report(df):
 def main():
     df = build_dataset()
     print_report(df)
+    RelevanceAnalyzer(df).print_report(top_n=15)
 
 
 if __name__ == "__main__":
