@@ -1,7 +1,8 @@
-"""Entry point: fetch data, add oracle labels, and report stats."""
+"""Entry point: fetch data, engineer indicators, add oracle labels, and report stats."""
 
 import pandas as pd
 
+from condition_finder import ConditionFinder
 from data_fetcher import DataFetcher
 from indicator_engine import IndicatorEngine
 from oracle_labeler import OracleLabeler
@@ -17,14 +18,19 @@ TOTAL_DAYS = 100
 ORACLE_LOOKAHEAD = 20
 ORACLE_MIN_REWARD_RISK_RATIO = 2.0  # 1:2 minimum - the winning side must be at least double the losing side
 
-# For now we only want to look at the oracle data itself, so the indicator engine
-# (and the relevance analysis that depends on it) is switched off. Flip this back
-# to True once indicators are needed again.
-INCLUDE_INDICATORS = False
+# Indicators are needed now (the EMA vs signal heatmap depends on EMA_20). The
+# relevance analysis is a separate, heavier report - keep it off unless asked for.
+INCLUDE_INDICATORS = True
+RUN_RELEVANCE_ANALYSIS = True
+RUN_CONDITION_SEARCH = True
+
+CONDITION_MIN_SUPPORT = 100
+CONDITION_MAX_COMBO_SIZE = 3
+
+EMA_COLUMN = "EMA_20"
+EMA_SIGNAL_HEATMAP_PATH = "signal_ema_heatmap.jpg"
 
 OHLCV_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
-ORACLE_LABEL_NAMES = {1: "UP", -1: "DOWN", 0: "NEUTRAL"}
-DIRECTION_SIGNAL_HEATMAP_PATH = "direction_signal_heatmap.jpg"
 
 
 def build_dataset():
@@ -51,65 +57,108 @@ def column_groups(df):
     return ohlcv_cols, indicator_cols, oracle_cols
 
 
-def direction_signal_crosstab(df):
-    """Cross-tab of oracle_direction vs oracle_signal: counts and row-percentages.
+def ema_signal_crosstab(df, ema_col=EMA_COLUMN):
+    """Cross-tab of "price vs EMA" trend state against oracle_signal.
 
     Returns None if either column is missing, else (counts, row_pct, row_order, col_order).
     """
-    if "oracle_direction" not in df.columns or "oracle_signal" not in df.columns:
+    if ema_col not in df.columns or "oracle_signal" not in df.columns:
         return None
 
-    known = df[df["oracle_direction"].notna() & df["oracle_signal"].notna()].copy()
-    known["direction_name"] = known["oracle_direction"].map(ORACLE_LABEL_NAMES)
+    known = df[df["oracle_signal"].notna() & df[ema_col].notna()].copy()
 
-    row_order = [name for name in ["UP", "DOWN", "NEUTRAL"] if name in known["direction_name"].unique()]
+    above_label = f"Above {ema_col}"
+    below_label = f"Below {ema_col}"
+    known["ema_state"] = (known["Close"] >= known[ema_col]).map({True: above_label, False: below_label})
+
+    row_order = [name for name in [above_label, below_label] if name in known["ema_state"].unique()]
     col_order = [s for s in ["BUY", "HOLD", "SELL"] if s in known["oracle_signal"].unique()]
 
-    counts = pd.crosstab(known["direction_name"], known["oracle_signal"]).reindex(
+    counts = pd.crosstab(known["ema_state"], known["oracle_signal"]).reindex(
         index=row_order, columns=col_order, fill_value=0
     )
     row_pct = counts.div(counts.sum(axis=1), axis=0) * 100
     return counts, row_pct, row_order, col_order
 
 
-def print_direction_signal_relationship(df):
-    """Show how oracle_direction (what actually happened) lines up with oracle_signal
-    (the reward:risk based call), so you can see which direction tends to produce
-    which kind of signal."""
-    crosstab = direction_signal_crosstab(df)
+def print_ema_signal_relationship(df):
+    """Show how price-vs-EMA trend state lines up with oracle_signal, so you can see
+    which trend state tends to produce which kind of signal."""
+    crosstab = ema_signal_crosstab(df)
     if crosstab is None:
         return
     counts, row_pct, row_order, col_order = crosstab
 
-    print("\n--- Direction vs Signal relationship ---")
-    print("(of the candles where the oracle direction was X, what % got each signal)")
+    print(f"\n--- {EMA_COLUMN} trend vs Signal relationship ---")
+    print(f"(of the candles where price was above/below {EMA_COLUMN}, what % got each signal)")
 
     print("\nCounts:")
     print(counts)
 
-    print("\nRow % (within each direction):")
+    print("\nRow % (within each trend state):")
     print(row_pct.round(1))
 
     print("\nIn words:")
-    for direction_name in row_order:
-        total = counts.loc[direction_name].sum()
-        parts = ", ".join(f"{col} {row_pct.loc[direction_name, col]:.1f}%" for col in col_order)
-        print(f"  When direction was {direction_name:<7} ({total:>5} candles) -> {parts}")
+    for state_name in row_order:
+        total = counts.loc[state_name].sum()
+        parts = ", ".join(f"{col} {row_pct.loc[state_name, col]:.1f}%" for col in col_order)
+        print(f"  When price was {state_name:<16} ({total:>5} candles) -> {parts}")
 
 
-def save_direction_signal_heatmap(df):
-    """Render the direction vs signal row-% table as a JPG heatmap."""
-    crosstab = direction_signal_crosstab(df)
+def save_ema_signal_heatmap(df):
+    """Render the EMA-trend vs signal row-% table as a JPG heatmap."""
+    crosstab = ema_signal_crosstab(df)
     if crosstab is None:
         return None
     _, row_pct, _, _ = crosstab
 
-    return HeatmapVisualizer(DIRECTION_SIGNAL_HEATMAP_PATH).plot_percentage_heatmap(
+    return HeatmapVisualizer(EMA_SIGNAL_HEATMAP_PATH).plot_percentage_heatmap(
         row_pct,
-        title="Oracle Direction vs Signal (row %)",
+        title=f"Signal vs {EMA_COLUMN} trend (row %)",
         x_label="Signal",
-        y_label="Direction",
+        y_label="Price vs EMA",
     )
+
+
+def print_signal_meaning(df):
+    """Explain in plain language + real averages what a BUY/HOLD/SELL signal means."""
+    if "oracle_signal" not in df.columns:
+        return
+
+    known = df[df["oracle_signal"].notna()]
+    stats_cols = ["oracle_upside_pct", "oracle_downside_pct", "oracle_upside_gap", "oracle_downside_gap"]
+    avg = known.groupby("oracle_signal")[stats_cols].mean()
+    counts = known["oracle_signal"].value_counts()
+
+    print(f"\n--- What each signal means (avg over the next {ORACLE_LOOKAHEAD} candles) ---")
+    for signal in ["BUY", "HOLD", "SELL"]:
+        if signal not in avg.index:
+            continue
+        row = avg.loc[signal]
+        n = int(counts.get(signal, 0))
+        print(f"\n{signal} ({n} candles, {n / len(known) * 100:.1f}% of known candles):")
+        print(f"  Avg potential upside   : +{row['oracle_upside_pct']:.2f}%  (price gap {row['oracle_upside_gap']:.4f})")
+        print(f"  Avg potential downside : {row['oracle_downside_pct']:.2f}%  (price gap {row['oracle_downside_gap']:.4f})")
+
+        if signal == "BUY":
+            print(
+                f"  Meaning: going forward {ORACLE_LOOKAHEAD} candles, the upside "
+                f"(+{row['oracle_upside_pct']:.2f}%) was at least {ORACLE_MIN_REWARD_RISK_RATIO:.0f}x "
+                f"bigger than the downside ({row['oracle_downside_pct']:.2f}%) -> a long trade had a "
+                f"clear, favorable reward:risk edge."
+            )
+        elif signal == "SELL":
+            print(
+                f"  Meaning: going forward {ORACLE_LOOKAHEAD} candles, the downside "
+                f"({row['oracle_downside_pct']:.2f}%) was at least {ORACLE_MIN_REWARD_RISK_RATIO:.0f}x "
+                f"bigger than the upside (+{row['oracle_upside_pct']:.2f}%) -> a short trade had a "
+                f"clear, favorable reward:risk edge."
+            )
+        else:
+            print(
+                "  Meaning: neither side cleared the "
+                f"{ORACLE_MIN_REWARD_RISK_RATIO:.0f}x bar over the other -> no clean edge, best to stay flat."
+            )
 
 
 def print_report(df):
@@ -122,14 +171,6 @@ def print_report(df):
     print(f"Date range             : {df.index.min()}  ->  {df.index.max()}")
     print(f"Missing values (total) : {int(df.isna().sum().sum())}")
 
-    if "oracle_direction" in df.columns:
-        print(f"\n--- Oracle direction (lookahead={ORACLE_LOOKAHEAD} candles, source of truth) ---")
-        counts = df["oracle_direction"].value_counts(dropna=False).sort_index()
-        for value, count in counts.items():
-            name = ORACLE_LABEL_NAMES.get(value, "UNKNOWN (tail, no future data yet)")
-            pct = count / len(df) * 100
-            print(f"  {name:<28}: {count:>6}  ({pct:5.1f}%)")
-
     if "oracle_signal" in df.columns:
         print(f"\n--- Oracle signal (min reward:risk = 1:{ORACLE_MIN_REWARD_RISK_RATIO:.0f}) ---")
         counts = df["oracle_signal"].value_counts(dropna=False).sort_index()
@@ -138,7 +179,8 @@ def print_report(df):
             pct = count / len(df) * 100
             print(f"  {name:<28}: {count:>6}  ({pct:5.1f}%)")
 
-    print_direction_signal_relationship(df)
+    print_signal_meaning(df)
+    print_ema_signal_relationship(df)
 
     ohlcv_cols, indicator_cols, oracle_cols = column_groups(df)
 
@@ -156,19 +198,11 @@ def print_report(df):
 
     preview_cols = [
         c
-        for c in [
-            "Close",
-            "oracle_range",
-            "oracle_upside_gap",
-            "oracle_downside_gap",
-            "oracle_actual_move_pct",
-            "oracle_direction",
-            "oracle_signal",
-        ]
+        for c in ["Close", EMA_COLUMN, "oracle_range", "oracle_upside_gap", "oracle_downside_gap", "oracle_signal"]
         if c in df.columns
     ]
-    if "oracle_direction" in df.columns:
-        known_rows = df[df["oracle_direction"].notna()]
+    if "oracle_signal" in df.columns:
+        known_rows = df[df["oracle_signal"].notna()]
         print(f"\n--- Last 5 candles with a known oracle outcome (out of {len(known_rows)}) ---")
         print(known_rows[preview_cols].tail(5))
     print("=" * 70 + "\n")
@@ -177,9 +211,13 @@ def print_report(df):
 def main():
     df = build_dataset()
     print_report(df)
-    save_direction_signal_heatmap(df)
-    if INCLUDE_INDICATORS:
+    save_ema_signal_heatmap(df)
+    if RUN_RELEVANCE_ANALYSIS:
         RelevanceAnalyzer(df).print_report(top_n=15)
+    if RUN_CONDITION_SEARCH:
+        ConditionFinder(
+            df, min_support=CONDITION_MIN_SUPPORT, max_combo_size=CONDITION_MAX_COMBO_SIZE
+        ).print_report()
 
 
 if __name__ == "__main__":
