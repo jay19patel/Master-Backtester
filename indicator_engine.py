@@ -233,7 +233,8 @@ class IndicatorEngine:
         new_features["range_compression"] = (df["High"] - df["Low"]).rolling(10).mean() / (
             df["High"] - df["Low"]
         ).rolling(50).mean()
-        new_features["range_velocity"] = (df["High"] - df["Low"]).pct_change()
+        rng = df["High"] - df["Low"]
+        new_features["range_velocity"] = (rng - rng.shift(1)) / (rng.shift(1) + 0.0001)
         new_features["fractal_proxy"] = df["ATR_pct"] / (df["volatility_10"] + 0.0001)
         new_features["vol_reversion_speed"] = (df["volatility_10"] - df["volatility_10"].shift(10)) / 10
 

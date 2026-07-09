@@ -18,6 +18,8 @@ curated list of common, well-understood trading conditions is built first (see
 import itertools
 
 import pandas as pd
+from rich.console import Console
+from rich.table import Table
 
 
 class ConditionFinder:
@@ -27,11 +29,10 @@ class ConditionFinder:
         ConditionFinder(df).print_report()
     """
 
-    def __init__(self, df, min_support=100, max_combo_size=3, top_n=15):
+    def __init__(self, df, min_support=100, max_combo_size=3):
         self.df = df
         self.min_support = min_support
         self.max_combo_size = max_combo_size
-        self.top_n = top_n
         self.conditions = self._build_conditions()
 
     def _build_conditions(self):
@@ -125,33 +126,44 @@ class ConditionFinder:
         return result, base_rate
 
     def print_report(self):
-        n_conditions = len(self.conditions)
-        print("\n" + "=" * 100)
-        print("CONDITION COMBINATION SEARCH (which indicator combos best match BUY/SELL)")
-        print("=" * 100)
-        print(f"Base conditions        : {n_conditions}")
-        print(f"Combo sizes tried      : 1 to {self.max_combo_size}")
-        print(f"Minimum support        : {self.min_support} candles (combos firing less often are dropped as noise)")
-        print("precision%             : of the candles where ALL conditions in the combo were true,")
-        print("                         what % actually got that oracle signal")
-        print("lift                   : precision / base rate - how many times better than a random")
-        print("                         guess this combo is (1.0x = no better than guessing)")
+        console = Console(width=220)
+        console.print(
+            f"[bold]CONDITION COMBINATION SEARCH[/bold] - {len(self.conditions)} base conditions, "
+            f"combo sizes 1-{self.max_combo_size}, min support {self.min_support} candles "
+            "(combos firing less often are dropped as noise)"
+        )
+        console.print(
+            "precision%: of the candles where ALL conditions in the combo were true, what % actually "
+            "got that oracle signal\n"
+            "lift: precision / base rate - how many times better than a random guess (1.0x = no better)"
+        )
 
         for target in ["BUY", "SELL"]:
             result, base_rate = self.find_best_combinations(target)
-            print(f"\n--- Best combinations for {target} (base rate: {base_rate:.1f}% of known candles) ---")
 
             if result.empty:
-                print("  No combination met the minimum support.")
+                console.print(f"\n[bold]{target}[/bold] (base rate {base_rate:.1f}%): no combination met the minimum support.")
                 continue
 
-            header = f"{'#':>3} {'Conditions':<75} {'support':>8} {'precision%':>11} {'lift':>6}"
-            print(header)
-            print("-" * len(header))
-            for i, row in result.head(self.top_n).iterrows():
-                print(
-                    f"{i + 1:>3} {row['conditions']:<75} {row['support']:>8} "
-                    f"{row['precision_pct']:>10.1f}% {row['lift']:>5.2f}x"
+            table = Table(
+                title=f"{target} combinations - base rate {base_rate:.1f}% of known candles "
+                f"({len(result)} combinations, most precise first)",
+                show_lines=False,
+            )
+            table.add_column("#", justify="right", style="dim")
+            table.add_column("Conditions", style="bold")
+            table.add_column("support", justify="right")
+            table.add_column("precision%", justify="right")
+            table.add_column("lift", justify="right")
+
+            for i, row in result.iterrows():
+                lift_style = "green" if row["lift"] >= 1.3 else ("yellow" if row["lift"] >= 1.0 else "red")
+                table.add_row(
+                    str(i + 1),
+                    row["conditions"],
+                    str(row["support"]),
+                    f"{row['precision_pct']:.1f}",
+                    f"[{lift_style}]{row['lift']:.2f}x[/{lift_style}]",
                 )
 
-        print("\n" + "=" * 100 + "\n")
+            console.print(table)

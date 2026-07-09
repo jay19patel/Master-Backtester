@@ -2,19 +2,22 @@
 
 import pandas as pd
 
+from backtester import Backtester
 from condition_finder import ConditionFinder
 from data_fetcher import DataFetcher
 from indicator_engine import IndicatorEngine
 from oracle_labeler import OracleLabeler
+from portfolio_manager import PortfolioManager
 from relevance_analyzer import RelevanceAnalyzer
+from signal_evaluator import evaluate_signals
 from visualizer import HeatmapVisualizer
 
 pd.set_option("display.max_columns", None)
 pd.set_option("display.width", 200)
 
-SYMBOL = "ETHUSD"
-INTERVAL = "15m"
-TOTAL_DAYS = 100
+SYMBOL = "BTCUSD"
+INTERVAL = "1h"
+TOTAL_DAYS = 365
 ORACLE_LOOKAHEAD = 20
 ORACLE_MIN_REWARD_RISK_RATIO = 2.0  # 1:2 minimum - the winning side must be at least double the losing side
 
@@ -26,6 +29,28 @@ RUN_CONDITION_SEARCH = True
 
 CONDITION_MIN_SUPPORT = 100
 CONDITION_MAX_COMBO_SIZE = 3
+
+RUN_PRICE_ACTION = True
+PRICE_ACTION_FORWARD_BARS = 10
+PRICE_ACTION_MIN_FIRES = 15
+
+RUN_BACKTEST = True
+BACKTEST_INITIAL_CAPITAL = 100.0
+BACKTEST_RISK_PER_TRADE_PCT = 2.0
+BACKTEST_STOP_LOSS_PCT = 1  # 0.5% stop-loss
+BACKTEST_TAKE_PROFIT_PCT = 2  # 1% target -> 1:2 reward:risk
+BACKTEST_MAX_HOLD_BARS = 20
+BACKTEST_FEE_PCT = 0.05
+
+RUN_PORTFOLIO = True
+PORTFOLIO_MAX_CONCURRENT_TRADES = 3
+PORTFOLIO_RISK_CAP_PCT = 6.0
+PORTFOLIO_DRAWDOWN_THROTTLE_TRIGGER_PCT = 10.0
+PORTFOLIO_DRAWDOWN_RECOVERY_PCT = 5.0
+PORTFOLIO_THROTTLED_RISK_PCT = 1.0
+PORTFOLIO_BREAKEVEN_TRIGGER_R = 1.0
+PORTFOLIO_TRAIL_TRIGGER_R = 1.5
+PORTFOLIO_TRAIL_DISTANCE_R = 0.5
 
 EMA_COLUMN = "EMA_20"
 EMA_SIGNAL_HEATMAP_PATH = "signal_ema_heatmap.jpg"
@@ -196,16 +221,39 @@ def print_report(df):
     for i, col in enumerate(indicator_cols, start=1):
         print(f"  {i:>3}. {col}")
 
-    preview_cols = [
-        c
-        for c in ["Close", EMA_COLUMN, "oracle_range", "oracle_upside_gap", "oracle_downside_gap", "oracle_signal"]
-        if c in df.columns
-    ]
-    if "oracle_signal" in df.columns:
-        known_rows = df[df["oracle_signal"].notna()]
-        print(f"\n--- Last 5 candles with a known oracle outcome (out of {len(known_rows)}) ---")
-        print(known_rows[preview_cols].tail(5))
     print("=" * 70 + "\n")
+
+
+def print_price_action_report(df):
+    """Run every PriceActionEngine sig_* strategy and rank them by forward-return
+    expectancy (in ATR units) over the next `PRICE_ACTION_FORWARD_BARS` candles."""
+    print("\n" + "=" * 100)
+    print(
+        f"PRICE ACTION SIGNAL EVALUATION (forward={PRICE_ACTION_FORWARD_BARS} candles, "
+        f"min fires={PRICE_ACTION_MIN_FIRES})"
+    )
+    print("=" * 100)
+    print("hit_rate    : of the candles this signal fired on, % that were profitable")
+    print("              `forward_bars` later (long signals measured long, shorts measured short)")
+    print("avg_R       : average forward move in ATR units (e.g. 0.5 = moved half an ATR in its favor)")
+    print("expectancy_R: hit_rate x avg_win - (1-hit_rate) x avg_loss -> the number that actually")
+    print("              matters: positive = this signal has a real edge, negative = it loses on average")
+
+    result = evaluate_signals(df, forward_bars=PRICE_ACTION_FORWARD_BARS, min_fires=PRICE_ACTION_MIN_FIRES)
+
+    header = f"{'Signal':<26} {'fires':>7} {'hit_rate':>9} {'avg_R':>8} {'expectancy_R':>13}"
+    print("\n" + header)
+    print("-" * len(header))
+    for _, row in result.iterrows():
+        if row["hit_rate"] is None:
+            print(f"{row['signal']:<26} {row['fires']:>7}   insufficient data (< {PRICE_ACTION_MIN_FIRES} fires)")
+        else:
+            print(
+                f"{row['signal']:<26} {row['fires']:>7} {row['hit_rate']:>9.1%} "
+                f"{row['avg_R']:>8.3f} {row['expectancy_R']:>13.3f}"
+            )
+    print("=" * 100 + "\n")
+    return result
 
 
 def main():
@@ -213,11 +261,52 @@ def main():
     print_report(df)
     save_ema_signal_heatmap(df)
     if RUN_RELEVANCE_ANALYSIS:
-        RelevanceAnalyzer(df).print_report(top_n=15)
+        RelevanceAnalyzer(df).print_report()
     if RUN_CONDITION_SEARCH:
         ConditionFinder(
             df, min_support=CONDITION_MIN_SUPPORT, max_combo_size=CONDITION_MAX_COMBO_SIZE
         ).print_report()
+    if RUN_PRICE_ACTION:
+        print_price_action_report(df)
+    backtest_result = None
+    if RUN_BACKTEST:
+        backtest_result = Backtester(
+            df,
+            initial_capital=BACKTEST_INITIAL_CAPITAL,
+            risk_per_trade_pct=BACKTEST_RISK_PER_TRADE_PCT,
+            stop_loss_pct=BACKTEST_STOP_LOSS_PCT,
+            take_profit_pct=BACKTEST_TAKE_PROFIT_PCT,
+            max_hold_bars=BACKTEST_MAX_HOLD_BARS,
+            fee_pct=BACKTEST_FEE_PCT,
+        ).print_report()
+
+    if RUN_PORTFOLIO and backtest_result is not None:
+        profitable_signals = backtest_result.loc[backtest_result["total_pnl"] > 0, "signal"].tolist()
+        if profitable_signals:
+            print(
+                f"[Portfolio] Trading the {len(profitable_signals)} signal(s) that were profitable "
+                f"standalone, together on one account: {profitable_signals}"
+            )
+            PortfolioManager(
+                df,
+                signals=profitable_signals,
+                initial_capital=BACKTEST_INITIAL_CAPITAL,
+                risk_per_trade_pct=BACKTEST_RISK_PER_TRADE_PCT,
+                stop_loss_pct=BACKTEST_STOP_LOSS_PCT,
+                take_profit_pct=BACKTEST_TAKE_PROFIT_PCT,
+                max_hold_bars=BACKTEST_MAX_HOLD_BARS,
+                fee_pct=BACKTEST_FEE_PCT,
+                max_concurrent_trades=PORTFOLIO_MAX_CONCURRENT_TRADES,
+                portfolio_risk_cap_pct=PORTFOLIO_RISK_CAP_PCT,
+                drawdown_throttle_trigger_pct=PORTFOLIO_DRAWDOWN_THROTTLE_TRIGGER_PCT,
+                drawdown_recovery_pct=PORTFOLIO_DRAWDOWN_RECOVERY_PCT,
+                throttled_risk_pct=PORTFOLIO_THROTTLED_RISK_PCT,
+                breakeven_trigger_r=PORTFOLIO_BREAKEVEN_TRIGGER_R,
+                trail_trigger_r=PORTFOLIO_TRAIL_TRIGGER_R,
+                trail_distance_r=PORTFOLIO_TRAIL_DISTANCE_R,
+            ).print_report()
+        else:
+            print("[Portfolio] No standalone-profitable signals found - skipping portfolio run.\n")
 
 
 if __name__ == "__main__":

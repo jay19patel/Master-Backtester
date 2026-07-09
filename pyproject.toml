@@ -11,5 +11,6 @@ dependencies = [
     "pandas-ta>=0.4.71b0",
     "pillow>=12.3.0",
     "requests>=2.34.2",
+    "rich>=15.0.0",
     "scipy>=1.18.0",
 ]

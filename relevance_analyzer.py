@@ -23,6 +23,8 @@ for every known candle.
 
 import numpy as np
 import pandas as pd
+from rich.console import Console
+from rich.table import Table
 
 EXCLUDED_COLUMNS = {"Open", "High", "Low", "Close", "Volume"}
 EXCLUDED_PREFIXES = ("oracle_",)
@@ -68,9 +70,16 @@ class RelevanceAnalyzer:
             if value_mask.sum() < self.min_samples or decisive_mask.sum() < self.min_samples:
                 continue
 
-            corr_value = value[value_mask].corr(net_edge[value_mask])
+            # A zero-variance slice (indicator flat over the whole sample) makes
+            # corr() divide by a zero std internally - guard it instead of letting
+            # numpy raise a RuntimeWarning for an undefined correlation.
+            corr_value = (
+                value[value_mask].corr(net_edge[value_mask]) if value[value_mask].std() > 0 else np.nan
+            )
             corr_change = (
-                change[change_mask].corr(net_edge[change_mask]) if change_mask.sum() >= self.min_samples else np.nan
+                change[change_mask].corr(net_edge[change_mask])
+                if change_mask.sum() >= self.min_samples and change[change_mask].std() > 0
+                else np.nan
             )
 
             # Only bars where the indicator actually moved count toward accuracy - a
@@ -113,49 +122,51 @@ class RelevanceAnalyzer:
         result = result.sort_values("relevance_score", ascending=False).reset_index(drop=True)
         return result
 
-    def print_report(self, top_n=15):
+    def print_report(self):
+        """Print every analyzed indicator in one table, most relevant first."""
         result = self.analyze()
-
-        print("\n" + "=" * 110)
-        print("INDICATOR RELEVANCE REPORT (vs oracle BUY/SELL signal)")
-        print("=" * 110)
+        console = Console(width=220)
 
         if result.empty:
-            print("No indicator had enough valid samples to analyze.")
-            print("=" * 110 + "\n")
+            console.print("[bold]INDICATOR RELEVANCE REPORT[/bold] - no indicator had enough valid samples.")
             return result
 
-        print(f"Indicators analyzed   : {len(result)}  (min {self.min_samples} samples required each)")
-        print("dir_accuracy%          : of the bars where the indicator ACTUALLY moved on a BUY or SELL")
-        print("                         candle, % of time it moved the same way the signal called (50% = coin flip)")
-        print("buy_match% / sell_match%: that same hit-rate split out for BUY candles vs SELL candles")
-        print("move_rate%             : % of BUY/SELL bars the indicator changed at all (flat bars are")
-        print("                         excluded from accuracy so rarely-moving indicators aren't unfairly judged)")
-        print("corr_value/corr_chg    : Pearson correlation of raw value / bar-to-bar change vs the oracle's")
-        print("                         net edge % (positive = BUY-side bigger, negative = SELL-side bigger)")
-
-        header = (
-            f"{'#':>3} {'Indicator':<24} {'dir_acc%':>9} {'buy_match%':>11} "
-            f"{'sell_match%':>12} {'move_%':>8} {'corr_val':>9} {'corr_chg':>9} {'n':>7}"
+        table = Table(
+            title=f"INDICATOR RELEVANCE REPORT vs oracle BUY/SELL signal "
+            f"({len(result)} indicators, min {self.min_samples} samples each, most relevant first)",
+            show_lines=False,
         )
-        divider = "-" * len(header)
+        table.add_column("#", justify="right", style="dim")
+        table.add_column("Indicator", style="bold")
+        table.add_column("dir_acc%", justify="right")
+        table.add_column("buy_match%", justify="right")
+        table.add_column("sell_match%", justify="right")
+        table.add_column("move_%", justify="right")
+        table.add_column("corr_val", justify="right")
+        table.add_column("corr_chg", justify="right")
+        table.add_column("n", justify="right")
 
-        def print_rows(rows_df, title):
-            print(f"\n--- {title} ---")
-            print(header)
-            print(divider)
-            for idx, row in rows_df.iterrows():
-                print(
-                    f"{idx + 1:>3} {row['indicator']:<24} "
-                    f"{row['dir_accuracy_pct']:>9.1f} {row['buy_match_pct']:>11.1f} "
-                    f"{row['sell_match_pct']:>12.1f} {row['move_rate_pct']:>8.1f} "
-                    f"{row['corr_value']:>9.3f} {row['corr_change']:>9.3f} {row['samples']:>7}"
-                )
+        for idx, row in result.iterrows():
+            deviation = row["dir_accuracy_pct"] - 50
+            acc_style = "green" if deviation > 0 else ("red" if deviation < 0 else "")
+            table.add_row(
+                str(idx + 1),
+                row["indicator"],
+                f"[{acc_style}]{row['dir_accuracy_pct']:.1f}[/{acc_style}]" if acc_style else f"{row['dir_accuracy_pct']:.1f}",
+                f"{row['buy_match_pct']:.1f}",
+                f"{row['sell_match_pct']:.1f}",
+                f"{row['move_rate_pct']:.1f}",
+                f"{row['corr_value']:.3f}",
+                f"{row['corr_change']:.3f}",
+                str(row["samples"]),
+            )
 
-        print_rows(result.head(top_n), f"Top {top_n} most relevant indicators")
-
-        bottom = result.tail(top_n).iloc[::-1]
-        print_rows(bottom, f"Bottom {top_n} least relevant indicators (closest to a coin flip)")
-
-        print("=" * 110 + "\n")
+        console.print(
+            "\ndir_accuracy%: of the bars where the indicator ACTUALLY moved on a BUY/SELL candle, % of "
+            "time it moved the same way the signal called (50% = coin flip)\n"
+            "buy_match% / sell_match%: that same hit-rate split for BUY candles vs SELL candles\n"
+            "move_%: % of BUY/SELL bars the indicator changed at all (flat bars excluded from accuracy)\n"
+            "corr_val/corr_chg: Pearson correlation of raw value / bar-to-bar change vs the oracle's net edge"
+        )
+        console.print(table)
         return result
