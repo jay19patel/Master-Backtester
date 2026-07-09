@@ -90,13 +90,20 @@ class Backtester:
     # Core simulation
     # ------------------------------------------------------------------
     def _simulate_signal(self, col):
+        return self.simulate_direction_array(self.df[col].to_numpy())
+
+    def simulate_direction_array(self, sig):
+        """Same trade simulation as _simulate_signal, but takes a raw +1/-1/0
+        direction array directly instead of a column name - lets other modules
+        (e.g. a combined/confluence signal built from several sig_* columns)
+        reuse this exact, already-validated simulation without needing to
+        write it to a real column on the DataFrame first."""
         df = self.df
         n = len(df)
         open_ = df["Open"].to_numpy()
         high = df["High"].to_numpy()
         low = df["Low"].to_numpy()
         close = df["Close"].to_numpy()
-        sig = df[col].to_numpy()
 
         equity = self.initial_capital
         trades = []

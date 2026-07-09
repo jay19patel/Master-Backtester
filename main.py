@@ -1,16 +1,20 @@
 """Entry point: fetch data, engineer indicators, add oracle labels, and report stats."""
 
+from datetime import datetime, timezone
+
 import pandas as pd
 
 from backtester import Backtester
 from condition_finder import ConditionFinder
 from data_fetcher import DataFetcher
 from indicator_engine import IndicatorEngine
+from oracle_backtester import OracleBacktester
 from oracle_labeler import OracleLabeler
 from portfolio_manager import PortfolioManager
 from relevance_analyzer import RelevanceAnalyzer
+from report_exporter import ReportExporter
+from signal_combo_backtester import SignalComboBacktester
 from signal_evaluator import evaluate_signals
-from visualizer import HeatmapVisualizer
 
 pd.set_option("display.max_columns", None)
 pd.set_option("display.width", 200)
@@ -28,7 +32,7 @@ RUN_RELEVANCE_ANALYSIS = True
 RUN_CONDITION_SEARCH = True
 
 CONDITION_MIN_SUPPORT = 100
-CONDITION_MAX_COMBO_SIZE = 3
+CONDITION_MAX_COMBO_SIZE = 4  # 3 or 4 indicators combined together, not just pairs
 
 RUN_PRICE_ACTION = True
 PRICE_ACTION_FORWARD_BARS = 10
@@ -52,8 +56,17 @@ PORTFOLIO_BREAKEVEN_TRIGGER_R = 1.0
 PORTFOLIO_TRAIL_TRIGGER_R = 1.5
 PORTFOLIO_TRAIL_DISTANCE_R = 0.5
 
+RUN_SIGNAL_COMBO_BACKTEST = True
+SIGNAL_COMBO_MIN_SIZE = 2
+SIGNAL_COMBO_MAX_SIZE = 4
+SIGNAL_COMBO_MIN_FIRES = 15
+
+RUN_ORACLE_BACKTEST = True
+
+RUN_JSON_EXPORT = True
+JSON_EXPORT_PATH = "report.json"
+
 EMA_COLUMN = "EMA_20"
-EMA_SIGNAL_HEATMAP_PATH = "signal_ema_heatmap.jpg"
 
 OHLCV_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 
@@ -128,21 +141,6 @@ def print_ema_signal_relationship(df):
         total = counts.loc[state_name].sum()
         parts = ", ".join(f"{col} {row_pct.loc[state_name, col]:.1f}%" for col in col_order)
         print(f"  When price was {state_name:<16} ({total:>5} candles) -> {parts}")
-
-
-def save_ema_signal_heatmap(df):
-    """Render the EMA-trend vs signal row-% table as a JPG heatmap."""
-    crosstab = ema_signal_crosstab(df)
-    if crosstab is None:
-        return None
-    _, row_pct, _, _ = crosstab
-
-    return HeatmapVisualizer(EMA_SIGNAL_HEATMAP_PATH).plot_percentage_heatmap(
-        row_pct,
-        title=f"Signal vs {EMA_COLUMN} trend (row %)",
-        x_label="Signal",
-        y_label="Price vs EMA",
-    )
 
 
 def print_signal_meaning(df):
@@ -259,7 +257,6 @@ def print_price_action_report(df):
 def main():
     df = build_dataset()
     print_report(df)
-    save_ema_signal_heatmap(df)
     if RUN_RELEVANCE_ANALYSIS:
         RelevanceAnalyzer(df).print_report()
     if RUN_CONDITION_SEARCH:
@@ -307,6 +304,79 @@ def main():
             ).print_report()
         else:
             print("[Portfolio] No standalone-profitable signals found - skipping portfolio run.\n")
+
+    if RUN_SIGNAL_COMBO_BACKTEST:
+        SignalComboBacktester(
+            df,
+            initial_capital=BACKTEST_INITIAL_CAPITAL,
+            risk_per_trade_pct=BACKTEST_RISK_PER_TRADE_PCT,
+            stop_loss_pct=BACKTEST_STOP_LOSS_PCT,
+            take_profit_pct=BACKTEST_TAKE_PROFIT_PCT,
+            max_hold_bars=BACKTEST_MAX_HOLD_BARS,
+            fee_pct=BACKTEST_FEE_PCT,
+            min_combo_size=SIGNAL_COMBO_MIN_SIZE,
+            max_combo_size=SIGNAL_COMBO_MAX_SIZE,
+            min_fires=SIGNAL_COMBO_MIN_FIRES,
+        ).print_report()
+
+    if RUN_ORACLE_BACKTEST:
+        OracleBacktester(
+            df,
+            initial_capital=BACKTEST_INITIAL_CAPITAL,
+            risk_per_trade_pct=BACKTEST_RISK_PER_TRADE_PCT,
+            stop_loss_pct=BACKTEST_STOP_LOSS_PCT,
+            take_profit_pct=BACKTEST_TAKE_PROFIT_PCT,
+            max_hold_bars=BACKTEST_MAX_HOLD_BARS,
+            fee_pct=BACKTEST_FEE_PCT,
+            portfolio_kwargs=dict(
+                max_concurrent_trades=PORTFOLIO_MAX_CONCURRENT_TRADES,
+                portfolio_risk_cap_pct=PORTFOLIO_RISK_CAP_PCT,
+                drawdown_throttle_trigger_pct=PORTFOLIO_DRAWDOWN_THROTTLE_TRIGGER_PCT,
+                drawdown_recovery_pct=PORTFOLIO_DRAWDOWN_RECOVERY_PCT,
+                throttled_risk_pct=PORTFOLIO_THROTTLED_RISK_PCT,
+            ),
+        ).print_report()
+
+    if RUN_JSON_EXPORT:
+        ReportExporter(df, export_config()).save(JSON_EXPORT_PATH)
+
+
+def export_config():
+    """Every setting ReportExporter needs, gathered from this module's constants."""
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "symbol": SYMBOL,
+        "interval": INTERVAL,
+        "total_days": TOTAL_DAYS,
+        "oracle_lookahead": ORACLE_LOOKAHEAD,
+        "oracle_min_reward_risk_ratio": ORACLE_MIN_REWARD_RISK_RATIO,
+        "ema_column": EMA_COLUMN,
+        "run_relevance_analysis": RUN_RELEVANCE_ANALYSIS,
+        "run_condition_search": RUN_CONDITION_SEARCH,
+        "condition_min_support": CONDITION_MIN_SUPPORT,
+        "condition_max_combo_size": CONDITION_MAX_COMBO_SIZE,
+        "run_price_action": RUN_PRICE_ACTION,
+        "price_action_forward_bars": PRICE_ACTION_FORWARD_BARS,
+        "price_action_min_fires": PRICE_ACTION_MIN_FIRES,
+        "run_backtest": RUN_BACKTEST,
+        "backtest_initial_capital": BACKTEST_INITIAL_CAPITAL,
+        "backtest_risk_per_trade_pct": BACKTEST_RISK_PER_TRADE_PCT,
+        "backtest_stop_loss_pct": BACKTEST_STOP_LOSS_PCT,
+        "backtest_take_profit_pct": BACKTEST_TAKE_PROFIT_PCT,
+        "backtest_max_hold_bars": BACKTEST_MAX_HOLD_BARS,
+        "backtest_fee_pct": BACKTEST_FEE_PCT,
+        "run_portfolio": RUN_PORTFOLIO,
+        "portfolio_max_concurrent_trades": PORTFOLIO_MAX_CONCURRENT_TRADES,
+        "portfolio_risk_cap_pct": PORTFOLIO_RISK_CAP_PCT,
+        "portfolio_drawdown_throttle_trigger_pct": PORTFOLIO_DRAWDOWN_THROTTLE_TRIGGER_PCT,
+        "portfolio_drawdown_recovery_pct": PORTFOLIO_DRAWDOWN_RECOVERY_PCT,
+        "portfolio_throttled_risk_pct": PORTFOLIO_THROTTLED_RISK_PCT,
+        "run_signal_combo_backtest": RUN_SIGNAL_COMBO_BACKTEST,
+        "signal_combo_min_size": SIGNAL_COMBO_MIN_SIZE,
+        "signal_combo_max_size": SIGNAL_COMBO_MAX_SIZE,
+        "signal_combo_min_fires": SIGNAL_COMBO_MIN_FIRES,
+        "run_oracle_backtest": RUN_ORACLE_BACKTEST,
+    }
 
 
 if __name__ == "__main__":
