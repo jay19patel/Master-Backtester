@@ -2,14 +2,21 @@
 BUY / SELL signal?
 
 Every column except OHLCV and the oracle_* columns is treated as "an indicator".
-For each one, this is measured against oracle_signal:
+For each one, this is measured against oracle_signal. Column names here match the
+same vocabulary used across the price-action and backtest reports, so the same
+concept always has the same name everywhere in this project:
 
+  - fires          : how many candles this indicator was actually evaluated on
+                      (same meaning as `fires` in the price-action / combo reports).
+  - hit_rate_pct    : the combined hit-rate across BUY and SELL candles (50% = coin
+                      flip, further away in either direction = a stronger connection
+                      to the signal). Same concept as `hit_rate` in the price-action
+                      report - here it's "did the indicator move the way the signal
+                      called" instead of "was the forward return profitable".
   - buy_match_pct  : of the bars where the oracle signal was BUY and the indicator
                       actually moved, % of time the indicator itself moved UP too.
   - sell_match_pct : of the bars where the oracle signal was SELL and the indicator
                       actually moved, % of time the indicator itself moved DOWN too.
-  - dir_accuracy   : the combined hit-rate across both (50% = coin flip, further away
-                      in either direction = a stronger connection to the signal).
   - corr_value / corr_change : Pearson correlation of the indicator's raw value / its
                       bar-to-bar change against the oracle's net edge (upside_pct +
                       downside_pct - positive when BUY-side dominates, negative when
@@ -31,17 +38,30 @@ EXCLUDED_PREFIXES = ("oracle_",)
 
 
 class RelevanceAnalyzer:
-    """Ranks indicator columns by how strongly they connect to the oracle's BUY/SELL signal.
+    """Ranks columns by how strongly they connect to the oracle's BUY/SELL signal.
 
     Usage:
-        RelevanceAnalyzer(df).print_report()
+        RelevanceAnalyzer(df).print_report()                                   # every indicator
+        RelevanceAnalyzer(df, columns=price_action_cols, label="Price Action").print_report()
     """
 
-    def __init__(self, df, min_samples=50):
+    def __init__(self, df, min_samples=50, columns=None, label="Indicator"):
+        """
+        columns: restrict analysis to exactly this column list (e.g. just the
+                 sig_* price-action columns) instead of every non-OHLCV/oracle
+                 column. Lets the exact same methodology/schema be reused for
+                 both the "Indicator" and "Price Action" reports.
+        label  : what to call the analyzed column set in the report title
+                 (e.g. "Indicator" or "Price Action").
+        """
         self.df = df
         self.min_samples = min_samples
+        self._columns = columns
+        self.label = label
 
     def indicator_columns(self):
+        if self._columns is not None:
+            return [col for col in self._columns if col in self.df.columns]
         return [
             col
             for col in self.df.columns
@@ -98,18 +118,18 @@ class RelevanceAnalyzer:
                 continue
 
             correct_calls = (change[buy_mask] > 0).sum() + (change[sell_mask] < 0).sum()
-            dir_accuracy = correct_calls / moved_mask.sum() * 100
+            hit_rate = correct_calls / moved_mask.sum() * 100
 
             rows.append(
                 {
                     "indicator": col,
-                    "dir_accuracy_pct": dir_accuracy,
+                    "hit_rate_pct": hit_rate,
                     "buy_match_pct": buy_match_pct,
                     "sell_match_pct": sell_match_pct,
                     "move_rate_pct": move_rate_pct,
                     "corr_value": corr_value,
                     "corr_change": corr_change,
-                    "samples": int(moved_mask.sum()),
+                    "fires": int(moved_mask.sum()),
                 }
             )
 
@@ -117,8 +137,8 @@ class RelevanceAnalyzer:
         if result.empty:
             return result
 
-        # Relevance = how far the directional hit-rate strays from a 50/50 coin flip.
-        result["relevance_score"] = (result["dir_accuracy_pct"] - 50).abs()
+        # Relevance = how far the hit-rate strays from a 50/50 coin flip.
+        result["relevance_score"] = (result["hit_rate_pct"] - 50).abs()
         result = result.sort_values("relevance_score", ascending=False).reset_index(drop=True)
         return result
 
@@ -128,41 +148,42 @@ class RelevanceAnalyzer:
         console = Console(width=220)
 
         if result.empty:
-            console.print("[bold]INDICATOR RELEVANCE REPORT[/bold] - no indicator had enough valid samples.")
+            console.print(f"[bold]{self.label.upper()} RELEVANCE REPORT[/bold] - nothing had enough valid samples.")
             return result
 
         table = Table(
-            title=f"INDICATOR RELEVANCE REPORT vs oracle BUY/SELL signal "
-            f"({len(result)} indicators, min {self.min_samples} samples each, most relevant first)",
+            title=f"{self.label.upper()} RELEVANCE REPORT vs oracle BUY/SELL signal "
+            f"({len(result)} columns, min {self.min_samples} samples each, most relevant first)",
             show_lines=False,
         )
         table.add_column("#", justify="right", style="dim")
-        table.add_column("Indicator", style="bold")
-        table.add_column("dir_acc%", justify="right")
+        table.add_column(self.label, style="bold")
+        table.add_column("fires", justify="right")
+        table.add_column("hit_rate%", justify="right")
         table.add_column("buy_match%", justify="right")
         table.add_column("sell_match%", justify="right")
         table.add_column("move_%", justify="right")
         table.add_column("corr_val", justify="right")
         table.add_column("corr_chg", justify="right")
-        table.add_column("n", justify="right")
 
         for idx, row in result.iterrows():
-            deviation = row["dir_accuracy_pct"] - 50
+            deviation = row["hit_rate_pct"] - 50
             acc_style = "green" if deviation > 0 else ("red" if deviation < 0 else "")
             table.add_row(
                 str(idx + 1),
                 row["indicator"],
-                f"[{acc_style}]{row['dir_accuracy_pct']:.1f}[/{acc_style}]" if acc_style else f"{row['dir_accuracy_pct']:.1f}",
+                str(row["fires"]),
+                f"[{acc_style}]{row['hit_rate_pct']:.1f}[/{acc_style}]" if acc_style else f"{row['hit_rate_pct']:.1f}",
                 f"{row['buy_match_pct']:.1f}",
                 f"{row['sell_match_pct']:.1f}",
                 f"{row['move_rate_pct']:.1f}",
                 f"{row['corr_value']:.3f}",
                 f"{row['corr_change']:.3f}",
-                str(row["samples"]),
             )
 
         console.print(
-            "\ndir_accuracy%: of the bars where the indicator ACTUALLY moved on a BUY/SELL candle, % of "
+            "\nfires: how many candles this indicator was actually evaluated on\n"
+            "hit_rate%: of the bars where the indicator ACTUALLY moved on a BUY/SELL candle, % of "
             "time it moved the same way the signal called (50% = coin flip)\n"
             "buy_match% / sell_match%: that same hit-rate split for BUY candles vs SELL candles\n"
             "move_%: % of BUY/SELL bars the indicator changed at all (flat bars excluded from accuracy)\n"

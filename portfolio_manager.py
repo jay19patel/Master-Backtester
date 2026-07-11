@@ -29,6 +29,8 @@ Usage:
 
 import numpy as np
 import pandas as pd
+from rich.console import Console
+from rich.table import Table
 
 from price_action_engine import PriceActionEngine
 
@@ -286,48 +288,67 @@ class PortfolioManager:
 
     def print_report(self):
         trades, final_equity, equity_curve = self.run()
+        console = Console(width=220)
 
-        print("\n" + "=" * 100)
-        print(f"PORTFOLIO BACKTEST: {len(self.signal_names)} signals traded together on one ${self.initial_capital:.0f} account")
-        print("=" * 100)
-        print(f"Signals             : {', '.join(self.signal_names)}")
-        print(f"Risk per trade       : {self.risk_per_trade_pct:.1f}% normal, {self.throttled_risk_pct:.1f}% "
-              f"while throttled (drawdown >= {self.drawdown_throttle_trigger_pct:.0f}%, "
-              f"restored below {self.drawdown_recovery_pct:.0f}%)")
-        print(f"Concurrent positions : max {self.max_concurrent_trades}, "
-              f"portfolio risk cap {self.portfolio_risk_cap_pct:.1f}% of equity")
-        print(f"Stop / Target        : {self.stop_loss_pct:.2f}% / {self.take_profit_pct:.2f}% initial bracket, "
-              f"breakeven at {self.breakeven_trigger_r:.1f}R, trail from {self.trail_trigger_r:.1f}R "
-              f"(trailing {self.trail_distance_r:.1f}R behind)")
+        console.print(
+            f"\n[bold]PORTFOLIO BACKTEST[/bold]: {len(self.signal_names)} signals traded together on one "
+            f"${self.initial_capital:.0f} account"
+        )
+        console.print(f"Signals             : {', '.join(self.signal_names)}")
+        console.print(
+            f"Risk per trade       : {self.risk_per_trade_pct:.1f}% normal, {self.throttled_risk_pct:.1f}% "
+            f"while throttled (drawdown >= {self.drawdown_throttle_trigger_pct:.0f}%, "
+            f"restored below {self.drawdown_recovery_pct:.0f}%)"
+        )
+        console.print(
+            f"Concurrent positions : max {self.max_concurrent_trades}, "
+            f"portfolio risk cap {self.portfolio_risk_cap_pct:.1f}% of equity"
+        )
+        console.print(
+            f"Stop / Target        : {self.stop_loss_pct:.2f}% / {self.take_profit_pct:.2f}% initial bracket, "
+            f"breakeven at {self.breakeven_trigger_r:.1f}R, trail from {self.trail_trigger_r:.1f}R "
+            f"(trailing {self.trail_distance_r:.1f}R behind)"
+        )
 
         n_trades = len(trades)
         if n_trades == 0:
-            print("\nNo trades were taken.")
-            print("=" * 100 + "\n")
+            console.print("\nNo trades were taken.")
             return trades, final_equity
 
         wins = [t for t in trades if t["pnl"] > 0]
         win_rate = len(wins) / n_trades * 100
         total_pnl = final_equity - self.initial_capital
         max_dd = self._max_drawdown_pct(equity_curve)
+        pnl_style = "green" if total_pnl > 0 else "red"
 
-        print(f"\nTotal trades         : {n_trades}")
-        print(f"Win rate             : {win_rate:.1f}%")
-        print(f"Final equity         : ${final_equity:.2f}  (started at ${self.initial_capital:.0f})")
-        print(f"Total PnL            : ${total_pnl:+.2f}  ({total_pnl / self.initial_capital * 100:+.1f}%)")
-        print(f"Max drawdown         : {max_dd:.1f}%")
+        console.print(f"[dim]Total trades[/dim]  {n_trades}")
+        console.print(f"[dim]Win rate[/dim]      {win_rate:.1f}%")
+        console.print(f"[dim]Final equity[/dim]  ${final_equity:.2f}  (started at ${self.initial_capital:.0f})")
+        console.print(
+            f"[dim]Total PnL[/dim]     [{pnl_style}]${total_pnl:+.2f}  "
+            f"({total_pnl / self.initial_capital * 100:+.1f}%)[/{pnl_style}]"
+        )
+        console.print(f"[dim]Max drawdown[/dim]  {max_dd:.1f}%")
 
         exit_reasons = pd.Series([t["exit_reason"] for t in trades]).value_counts()
-        print("\nExit reasons:")
+        exit_table = Table(title="Exit reasons", show_lines=False)
+        exit_table.add_column("Reason", style="bold")
+        exit_table.add_column("Count", justify="right")
+        exit_table.add_column("Percent", justify="right")
         for reason, count in exit_reasons.items():
-            print(f"  {reason:<10}: {count:>5}  ({count / n_trades * 100:5.1f}%)")
+            exit_table.add_row(reason, str(count), f"{count / n_trades * 100:.1f}%")
+        console.print(exit_table)
 
         per_signal = pd.DataFrame(trades).groupby("signal")["pnl"].agg(["count", "sum"]).rename(
             columns={"count": "trades", "sum": "pnl"}
         )
-        print("\nContribution per signal:")
+        contrib_table = Table(title="Contribution per signal", show_lines=False)
+        contrib_table.add_column("Signal", style="bold")
+        contrib_table.add_column("trades", justify="right")
+        contrib_table.add_column("pnl", justify="right")
         for name, row in per_signal.sort_values("pnl", ascending=False).iterrows():
-            print(f"  {name:<24} {int(row['trades']):>5} trades  ${row['pnl']:+.2f}")
+            row_style = "green" if row["pnl"] > 0 else "red"
+            contrib_table.add_row(name, str(int(row["trades"])), f"[{row_style}]{row['pnl']:+.2f}[/{row_style}]")
+        console.print(contrib_table)
 
-        print("=" * 100 + "\n")
         return trades, final_equity

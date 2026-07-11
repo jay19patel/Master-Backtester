@@ -15,12 +15,9 @@ import math
 import pandas as pd
 
 from backtester import Backtester
-from condition_finder import ConditionFinder
+from combo_backtester import ComboBacktester
 from oracle_backtester import OracleBacktester
-from portfolio_manager import PortfolioManager
 from relevance_analyzer import RelevanceAnalyzer
-from signal_combo_backtester import SignalComboBacktester
-from signal_evaluator import evaluate_signals
 
 OHLCV_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 
@@ -76,12 +73,13 @@ class ReportExporter:
         df = self.df
         ohlcv = [c for c in OHLCV_COLUMNS if c in df.columns]
         oracle = [c for c in df.columns if c.startswith("oracle_")]
-        indicator = [c for c in df.columns if c not in ohlcv and c not in oracle]
-        return ohlcv, oracle, indicator
+        price_action = [c for c in df.columns if c.startswith("sig_")]
+        indicator = [c for c in df.columns if c not in ohlcv and c not in oracle and c not in price_action]
+        return ohlcv, oracle, indicator, price_action
 
     def _dataset_section(self):
         df = self.df
-        ohlcv, oracle, indicator = self._column_groups()
+        ohlcv, oracle, indicator, price_action = self._column_groups()
         return {
             "symbol": self.config.get("symbol"),
             "interval": self.config.get("interval"),
@@ -90,7 +88,7 @@ class ReportExporter:
             "date_start": df.index.min().isoformat(),
             "date_end": df.index.max().isoformat(),
             "missing_values": int(df.isna().sum().sum()),
-            "column_groups": {"ohlcv": ohlcv, "oracle": oracle, "indicator": indicator},
+            "column_groups": {"ohlcv": ohlcv, "oracle": oracle, "indicator": indicator, "price_action": price_action},
         }
 
     def _oracle_section(self):
@@ -124,64 +122,18 @@ class ReportExporter:
             "signal_meaning": signal_meaning,
         }
 
-    def _ema_signal_section(self):
-        df = self.df
-        ema_col = self.config.get("ema_column", "EMA_20")
-        if ema_col not in df.columns or "oracle_signal" not in df.columns:
-            return None
-
-        known = df[df["oracle_signal"].notna() & df[ema_col].notna()].copy()
-        above, below = f"Above {ema_col}", f"Below {ema_col}"
-        known["ema_state"] = (known["Close"] >= known[ema_col]).map({True: above, False: below})
-
-        row_order = [name for name in [above, below] if name in known["ema_state"].unique()]
-        col_order = [s for s in ["BUY", "HOLD", "SELL"] if s in known["oracle_signal"].unique()]
-
-        counts = pd.crosstab(known["ema_state"], known["oracle_signal"]).reindex(
-            index=row_order, columns=col_order, fill_value=0
-        )
-        row_pct = counts.div(counts.sum(axis=1), axis=0) * 100
-
-        return {
-            "ema_column": ema_col,
-            "rows": [
-                {
-                    "state": state,
-                    "counts": {c: int(counts.loc[state, c]) for c in col_order},
-                    "row_pct": {c: safe_round(row_pct.loc[state, c], 1) for c in col_order},
-                }
-                for state in row_order
-            ],
-        }
-
-    def _relevance_section(self):
+    def _indicator_relevance_section(self):
         if not self.config.get("run_relevance_analysis"):
             return None
-        result = RelevanceAnalyzer(self.df).analyze()
+        _, _, indicator_cols, _ = self._column_groups()
+        result = RelevanceAnalyzer(self.df, columns=indicator_cols, label="Indicator").analyze()
         return records(result)
 
-    def _condition_section(self):
-        if not self.config.get("run_condition_search"):
+    def _price_action_relevance_section(self):
+        if not self.config.get("run_relevance_analysis"):
             return None
-        finder = ConditionFinder(
-            self.df,
-            min_support=self.config.get("condition_min_support", 100),
-            max_combo_size=self.config.get("condition_max_combo_size", 3),
-        )
-        out = {}
-        for target in ["BUY", "SELL"]:
-            result, base_rate = finder.find_best_combinations(target)
-            out[target] = {"base_rate_pct": safe_round(base_rate, 2), "combinations": records(result)}
-        return out
-
-    def _price_action_section(self):
-        if not self.config.get("run_price_action"):
-            return None
-        result = evaluate_signals(
-            self.df,
-            forward_bars=self.config.get("price_action_forward_bars", 10),
-            min_fires=self.config.get("price_action_min_fires", 15),
-        )
+        _, _, _, price_action_cols = self._column_groups()
+        result = RelevanceAnalyzer(self.df, columns=price_action_cols, label="Price Action").analyze()
         return records(result)
 
     def _backtest_section(self):
@@ -227,69 +179,10 @@ class ReportExporter:
         }
         return section, result
 
-    def _portfolio_section(self, backtest_result):
-        if not self.config.get("run_portfolio") or backtest_result is None or backtest_result.empty:
+    def _combo_backtest_section(self):
+        if not self.config.get("run_combo_backtest"):
             return None
-
-        profitable = backtest_result.loc[backtest_result["total_pnl"] > 0, "signal"].tolist()
-        if not profitable:
-            return {"signals_used": [], "message": "No standalone-profitable signals found."}
-
-        pm = PortfolioManager(
-            self.df,
-            signals=profitable,
-            initial_capital=self.config["backtest_initial_capital"],
-            risk_per_trade_pct=self.config["backtest_risk_per_trade_pct"],
-            stop_loss_pct=self.config["backtest_stop_loss_pct"],
-            take_profit_pct=self.config["backtest_take_profit_pct"],
-            max_hold_bars=self.config["backtest_max_hold_bars"],
-            fee_pct=self.config["backtest_fee_pct"],
-            max_concurrent_trades=self.config["portfolio_max_concurrent_trades"],
-            portfolio_risk_cap_pct=self.config["portfolio_risk_cap_pct"],
-            drawdown_throttle_trigger_pct=self.config["portfolio_drawdown_throttle_trigger_pct"],
-            drawdown_recovery_pct=self.config["portfolio_drawdown_recovery_pct"],
-            throttled_risk_pct=self.config["portfolio_throttled_risk_pct"],
-        )
-        trades, final_equity, equity_curve = pm.run()
-        n_trades = len(trades)
-        wins = [t for t in trades if t["pnl"] > 0]
-
-        exit_reasons = {}
-        per_signal = {}
-        for t in trades:
-            exit_reasons[t["exit_reason"]] = exit_reasons.get(t["exit_reason"], 0) + 1
-            row = per_signal.setdefault(t["signal"], {"trades": 0, "pnl": 0.0})
-            row["trades"] += 1
-            row["pnl"] += t["pnl"]
-
-        return {
-            "signals_used": profitable,
-            "config": {
-                "max_concurrent_trades": self.config["portfolio_max_concurrent_trades"],
-                "portfolio_risk_cap_pct": self.config["portfolio_risk_cap_pct"],
-                "drawdown_throttle_trigger_pct": self.config["portfolio_drawdown_throttle_trigger_pct"],
-                "drawdown_recovery_pct": self.config["portfolio_drawdown_recovery_pct"],
-                "throttled_risk_pct": self.config["portfolio_throttled_risk_pct"],
-            },
-            "summary": {
-                "trades": n_trades,
-                "win_rate_pct": safe_round(len(wins) / n_trades * 100, 1) if n_trades else None,
-                "final_equity": safe_round(final_equity, 2),
-                "total_pnl": safe_round(final_equity - self.config["backtest_initial_capital"], 2),
-                "max_drawdown_pct": safe_round(PortfolioManager._max_drawdown_pct(equity_curve), 1),
-            },
-            "exit_reasons": exit_reasons,
-            "per_signal_contribution": [
-                {"signal": s, "trades": v["trades"], "pnl": safe_round(v["pnl"], 2)}
-                for s, v in sorted(per_signal.items(), key=lambda kv: -kv[1]["pnl"])
-            ],
-            "equity_curve": [round(v, 2) for v in equity_curve],
-        }
-
-    def _signal_combo_section(self):
-        if not self.config.get("run_signal_combo_backtest"):
-            return None
-        combo_bt = SignalComboBacktester(
+        combo_bt = ComboBacktester(
             self.df,
             initial_capital=self.config["backtest_initial_capital"],
             risk_per_trade_pct=self.config["backtest_risk_per_trade_pct"],
@@ -297,18 +190,20 @@ class ReportExporter:
             take_profit_pct=self.config["backtest_take_profit_pct"],
             max_hold_bars=self.config["backtest_max_hold_bars"],
             fee_pct=self.config["backtest_fee_pct"],
-            min_combo_size=self.config.get("signal_combo_min_size", 2),
-            max_combo_size=self.config.get("signal_combo_max_size", 4),
-            min_fires=self.config.get("signal_combo_min_fires", 15),
+            min_combo_size=self.config.get("combo_min_size", 1),
+            max_combo_size=self.config.get("combo_max_size", 4),
+            min_fires=self.config.get("combo_min_fires", 15),
         )
         result = combo_bt.run()
+        profitable = result[result["total_pnl"] > 0] if not result.empty else result
         return {
             "config": {
-                "min_combo_size": self.config.get("signal_combo_min_size", 2),
-                "max_combo_size": self.config.get("signal_combo_max_size", 4),
-                "min_fires": self.config.get("signal_combo_min_fires", 15),
+                "min_combo_size": self.config.get("combo_min_size", 1),
+                "max_combo_size": self.config.get("combo_max_size", 4),
+                "min_fires": self.config.get("combo_min_fires", 15),
+                **combo_bt.stats,
             },
-            "combinations": records(result),
+            "combinations": records(profitable),
         }
 
     def _oracle_backtest_section(self):
@@ -342,19 +237,16 @@ class ReportExporter:
         }
 
     def build(self):
-        backtest_section, backtest_df = self._backtest_section()
+        backtest_section, _ = self._backtest_section()
         return {
             "generated_at": self.config.get("generated_at"),
             "config": {k: v for k, v in self.config.items() if k != "generated_at"},
             "dataset": self._dataset_section(),
             "oracle": self._oracle_section(),
-            "ema_signal_relationship": self._ema_signal_section(),
-            "relevance": self._relevance_section(),
-            "condition_search": self._condition_section(),
-            "price_action_evaluation": self._price_action_section(),
+            "indicator_relevance": self._indicator_relevance_section(),
+            "price_action_relevance": self._price_action_relevance_section(),
             "backtest": backtest_section,
-            "portfolio": self._portfolio_section(backtest_df),
-            "signal_combo_backtest": self._signal_combo_section(),
+            "combo_backtest": self._combo_backtest_section(),
             "oracle_backtest": self._oracle_backtest_section(),
         }
 

@@ -30,6 +30,8 @@ fees, is a real edge; anything at or below it is not.
 
 import numpy as np
 import pandas as pd
+from rich.console import Console
+from rich.table import Table
 
 from price_action_engine import PriceActionEngine
 
@@ -248,99 +250,75 @@ class Backtester:
         merged["fee_drag_$"] = (merged["total_pnl_no_fees"] - merged["total_pnl"]).round(2)
         return merged.sort_values("total_pnl_no_fees", ascending=False).reset_index(drop=True)
 
+    @staticmethod
+    def _signals_table(title, result):
+        table = Table(title=title, show_lines=False)
+        table.add_column("#", justify="right", style="dim")
+        table.add_column("Signal", style="bold")
+        table.add_column("trades", justify="right")
+        table.add_column("win_rate%", justify="right")
+        table.add_column("final_$", justify="right")
+        table.add_column("total_pnl", justify="right")
+        table.add_column("total_profit", justify="right")
+        table.add_column("total_loss", justify="right")
+        table.add_column("return%", justify="right")
+        table.add_column("avg_pnl", justify="right")
+        table.add_column("max_dd%", justify="right")
+
+        for i, row in result.iterrows():
+            pnl_style = "green" if row["total_pnl"] > 0 else "red"
+            table.add_row(
+                str(i + 1),
+                row["signal"],
+                str(row["trades"]),
+                f"{row['win_rate_pct']:.1f}",
+                f"{row['final_equity']:.2f}",
+                f"[{pnl_style}]{row['total_pnl']:+.2f}[/{pnl_style}]",
+                f"{row['total_profit']:.2f}",
+                f"{row['total_loss']:.2f}",
+                f"[{pnl_style}]{row['return_pct']:+.1f}[/{pnl_style}]",
+                f"{row['avg_pnl_per_trade']:.3f}",
+                f"{row['max_drawdown_pct']:.1f}",
+            )
+        return table
+
     def print_report(self):
         result = self.run()
+        console = Console(width=220)
 
-        print("\n" + "=" * 100)
-        print(f"BACKTEST: every signal traded on its own ${self.initial_capital:.0f} starting balance")
-        print("=" * 100)
-        print(f"Risk per trade      : {self.risk_per_trade_pct:.1f}% of current equity")
-        print(f"Stop-loss / Target  : {self.stop_loss_pct:.2f}% / {self.take_profit_pct:.2f}% "
-              f"(1:{self.take_profit_pct / self.stop_loss_pct:.1f} reward:risk)")
-        print(f"Max holding period  : {self.max_hold_bars} candles (else closed at market)")
-        print(f"Fees (round trip)   : {self.fee_pct * 2:.2f}% of trade notional")
-        print(
+        console.print(f"\n[bold]BACKTEST[/bold]: every signal traded on its own ${self.initial_capital:.0f} starting balance")
+        console.print(f"Risk per trade      : {self.risk_per_trade_pct:.1f}% of current equity")
+        console.print(
+            f"Stop-loss / Target  : {self.stop_loss_pct:.2f}% / {self.take_profit_pct:.2f}% "
+            f"(1:{self.take_profit_pct / self.stop_loss_pct:.1f} reward:risk)"
+        )
+        console.print(f"Max holding period  : {self.max_hold_bars} candles (else closed at market)")
+        console.print(f"Fees (round trip)   : {self.fee_pct * 2:.2f}% of trade notional")
+        console.print(
             f"Breakeven win rate  : {self.breakeven_win_rate_pct:.1f}% before fees, "
             f"{self.fee_adjusted_breakeven_win_rate_pct:.1f}% after fees "
             "(the real bar a signal's win rate must clear)"
         )
 
         if result.empty:
-            print("\nNo signal produced any trades.")
-            print("=" * 100 + "\n")
+            console.print("\nNo signal produced any trades.")
             return result
 
-        header = (
-            f"{'#':>3} {'Signal':<24} {'trades':>7} {'win_rate%':>10} {'final_$':>10} "
-            f"{'total_pnl':>10} {'total_profit':>13} {'total_loss':>11} {'return%':>8} "
-            f"{'avg_pnl':>9} {'max_dd%':>8}"
+        console.print(
+            "\n(total_profit = sum of only the winning trades' PnL, total_loss = sum of only the losing trades' PnL)"
         )
-        divider = "-" * len(header)
-
-        def print_row(rank, row):
-            print(
-                f"{rank:>3} {row['signal']:<24} {row['trades']:>7} {row['win_rate_pct']:>10.1f} "
-                f"{row['final_equity']:>10.2f} {row['total_pnl']:>10.2f} {row['total_profit']:>13.2f} "
-                f"{row['total_loss']:>11.2f} {row['return_pct']:>8.1f} "
-                f"{row['avg_pnl_per_trade']:>9.3f} {row['max_drawdown_pct']:>8.1f}"
-            )
-
-        print(f"\n--- All signals, ranked by total PnL ---")
-        print("(total_profit = sum of only the winning trades' PnL, total_loss = sum of only the losing trades' PnL)")
-        print(header)
-        print(divider)
-        for i, row in result.iterrows():
-            print_row(i + 1, row)
+        console.print(self._signals_table("All signals, ranked by total PnL", result))
 
         profitable = result[result["total_pnl"] > 0]
-        print(f"\n--- Profitable signals only ({len(profitable)} of {len(result)}) ---")
         if profitable.empty:
-            print("  None. Every signal lost money under these realistic assumptions.")
+            console.print("\n[bold]Profitable signals: none.[/bold] Every signal lost money under these realistic assumptions.")
         else:
-            print(header)
-            print(divider)
-            for i, row in profitable.iterrows():
-                print_row(i + 1, row)
-            print(
-                f"\n  Best: {profitable.iloc[0]['signal']} turned "
-                f"${self.initial_capital:.0f} into ${profitable.iloc[0]['final_equity']:.2f} "
-                f"({profitable.iloc[0]['return_pct']:.1f}%) over {profitable.iloc[0]['trades']} trades, "
-                f"{profitable.iloc[0]['win_rate_pct']:.1f}% win rate."
+            console.print(self._signals_table(f"Profitable signals only ({len(profitable)} of {len(result)})", profitable))
+            best = profitable.iloc[0]
+            console.print(
+                f"\n[bold]Best:[/bold] {best['signal']} turned ${self.initial_capital:.0f} into "
+                f"${best['final_equity']:.2f} ({best['return_pct']:+.1f}%) over {best['trades']} trades, "
+                f"{best['win_rate_pct']:.1f}% win rate."
             )
 
-        # If fees wiped out most/all of the profitable signals, show WHY - a tight
-        # stop forces high leverage on a small account, and fees are charged on
-        # that leveraged notional, not on the $ actually being risked.
-        if len(profitable) < len(result):
-            implied_leverage, fee_pct_of_risk = self._fee_drag_stats()
-            comparison = self.run_no_fee_comparison()
-            no_fee_profitable = comparison[comparison["total_pnl_no_fees"] > 0]
-
-            print(f"\n--- Why fees matter here ---")
-            print(
-                f"  A {self.stop_loss_pct:.2f}% stop implies roughly "
-                f"{implied_leverage:.1f}x leverage to risk {self.risk_per_trade_pct:.1f}% of equity."
-            )
-            print(f"  At {self.fee_pct * 2:.2f}% round-trip fees, that eats ~{fee_pct_of_risk:.1f}% of the")
-            print("  dollar amount risked on EVERY trade, win or lose - that gap is what separates")
-            print("  the fee-free numbers below from the realistic ones above.")
-
-            print(f"\n  Same signals with fees stripped out ({len(no_fee_profitable)} of {len(comparison)} profitable):")
-            cmp_header = f"  {'Signal':<24} {'win_rate%':>10} {'pnl_with_fees':>14} {'pnl_no_fees':>12} {'fee_drag_$':>11}"
-            print(cmp_header)
-            print("  " + "-" * (len(cmp_header) - 2))
-            for _, row in comparison.head(8).iterrows():
-                print(
-                    f"  {row['signal']:<24} {row['win_rate_pct']:>10.1f} {row['total_pnl']:>14.2f} "
-                    f"{row['total_pnl_no_fees']:>12.2f} {row['fee_drag_$']:>11.2f}"
-                )
-            print(
-                "\n  Takeaway: the directional edge in these signals is real for some of them, but at "
-                f"this stop width and account size, fees alone cost more than {self.risk_per_trade_pct:.1f}% "
-                "risk-per-trade can absorb. A wider stop (lower leverage), a lower-fee venue, or trading "
-                "with more capital (same % risk, but fees become a smaller share of the risked amount) "
-                "would all shrink this gap."
-            )
-
-        print("=" * 100 + "\n")
         return result

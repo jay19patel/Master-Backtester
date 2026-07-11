@@ -159,6 +159,18 @@
   }
   .warning-banner strong { color: var(--yellow); }
 
+  .callout {
+    background: rgba(46, 160, 67, 0.12);
+    border: 1px solid var(--green);
+    color: var(--text);
+    border-radius: 10px;
+    padding: 14px 18px;
+    font-size: 0.92rem;
+    line-height: 1.5;
+    margin-bottom: 20px;
+  }
+  .callout strong { color: var(--green); }
+
   #error-box {
     max-width: 720px; margin: 60px auto; background: var(--panel); border: 1px solid var(--border);
     border-radius: 10px; padding: 24px 28px;
@@ -197,27 +209,17 @@
       <div class="panel" id="oracle-bars"></div>
       <h2>What each signal means</h2>
       <div class="cards" id="oracle-meaning-cards"></div>
-      <h2 id="ema-title">Price vs EMA relationship</h2>
-      <div class="panel" id="ema-bar-chart"></div>
-      <div class="panel" id="ema-table-container"></div>
     </section>
 
     <section class="tab" data-tab="relevance">
       <h2>Indicator relevance vs oracle BUY/SELL signal</h2>
-      <p class="note">dir_accuracy%: of the bars the indicator actually moved on a BUY/SELL candle, % it moved the same way the signal called (50% = coin flip). corr_value / corr_change: Pearson correlation of raw value / bar-to-bar change vs the oracle's net edge.</p>
+      <p class="note">fires: how many candles this was evaluated on. hit_rate%: of the bars it actually moved on a BUY/SELL candle, % it moved the same way the signal called (50% = coin flip). buy_match% / sell_match%: that hit-rate split by BUY vs SELL candles. corr_value / corr_change: Pearson correlation of raw value / bar-to-bar change vs the oracle's net edge.</p>
       <div id="relevance-table-container"></div>
     </section>
 
-    <section class="tab" data-tab="conditions">
-      <h2>Condition combination search</h2>
-      <p class="note">precision%: of the candles where ALL conditions in the combo were true, what % actually got that oracle signal. lift: precision / base rate (1.0x = no better than guessing).</p>
-      <div class="subtabs" id="condition-subtabs"></div>
-      <div id="condition-table-container"></div>
-    </section>
-
     <section class="tab" data-tab="priceaction">
-      <h2>Price action signal evaluation</h2>
-      <p class="note">hit_rate: % of fires that were profitable N candles later. avg_R: average forward move in ATR units. expectancy_R: the number that matters - positive means a real edge, negative means it loses on average.</p>
+      <h2>Price Action relevance vs oracle BUY/SELL signal</h2>
+      <p class="note">Same methodology and columns as the Indicator tab, applied to the sig_* price-action signals instead of technical indicators - so the two are directly comparable.</p>
       <div id="priceaction-table-container"></div>
     </section>
 
@@ -235,20 +237,14 @@
       <div id="feecomparison-table-container"></div>
     </section>
 
-    <section class="tab" data-tab="portfolio">
-      <h2>Portfolio - signals traded together with risk management</h2>
-      <div id="portfolio-body"></div>
-      <h2>Equity curve</h2>
-      <div class="panel chart-panel" id="portfolio-equity-chart"></div>
-    </section>
-
     <section class="tab" data-tab="combos">
-      <h2>Signal combination backtest</h2>
-      <p class="note">Combines multiple price-action signals - ALL must agree on direction on the same candle - and backtests each combination the same realistic way as a single signal. Most combinations naturally get zero/few fires since requiring several sparse signals to align exactly is rare; only combinations clearing the minimum fire count are shown.</p>
+      <h2>Combo backtest</h2>
+      <p class="note">Searches combinations that freely mix EVERY indicator column (each compared to its own trailing rolling median) together with every price-action signal - ALL must agree on direction on the same candle - and backtests each one for real PnL the same realistic way as a single signal (entry at next open, stop/target bracket, risk-based sizing, fees). Most combinations naturally get zero/few fires since requiring several conditions to align exactly is rare; only profitable combinations are shown below, ranked by total PnL so the biggest profit/capital-growth combination is always row 1.</p>
       <div class="cards" id="combo-config-cards"></div>
-      <h2>Top combinations by total PnL</h2>
+      <div class="callout" id="combo-best-callout"></div>
+      <h2>Top profitable combinations by total PnL</h2>
       <div class="panel chart-panel" id="combo-bar-chart"></div>
-      <h2>All qualifying combinations</h2>
+      <h2>All profitable combinations</h2>
       <div id="combo-table-container"></div>
     </section>
 
@@ -270,7 +266,12 @@
 
   function fmt(value, digits) {
     if (value === null || value === undefined) return "-";
-    if (typeof value === "number") return value.toFixed(digits === undefined ? 2 : digits);
+    if (typeof value === "number") {
+      // No explicit digits requested and it's a whole number (counts like
+      // trades/size/fires) - show it plainly instead of e.g. "4.00".
+      if (digits === undefined && Number.isInteger(value)) return String(value);
+      return value.toFixed(digits === undefined ? 2 : digits);
+    }
     return String(value);
   }
 
@@ -507,11 +508,9 @@
     { key: "overview", label: "Overview" },
     { key: "oracle", label: "Oracle" },
     { key: "relevance", label: "Relevance" },
-    { key: "conditions", label: "Conditions" },
     { key: "priceaction", label: "Price Action" },
     { key: "backtest", label: "Backtest" },
-    { key: "portfolio", label: "Portfolio" },
-    { key: "combos", label: "Signal Combos" },
+    { key: "combos", label: "Combo Backtest" },
     { key: "oracleceiling", label: "Oracle Ceiling" },
   ];
 
@@ -573,8 +572,10 @@
     });
 
     var groups = d.column_groups;
+    var priceActionCols = groups.price_action || [];
     document.getElementById("column-summary").textContent =
-      groups.ohlcv.length + " OHLCV, " + groups.oracle.length + " oracle, " + groups.indicator.length + " indicator columns.";
+      groups.ohlcv.length + " OHLCV, " + groups.oracle.length + " oracle, " + groups.indicator.length +
+      " indicator, " + priceActionCols.length + " price-action columns.";
     var listContainer = document.getElementById("column-list");
     groups.oracle.forEach(function (name) {
       listContainer.appendChild(el("span", { class: "chip" }, [name]));
@@ -606,89 +607,88 @@
       ]));
     });
 
-    var ema = report.ema_signal_relationship;
-    if (ema) {
-      document.getElementById("ema-title").textContent = "Price vs " + ema.ema_column + " relationship";
-      var barItems = [];
-      var signalColors = { BUY: "var(--green)", SELL: "var(--red)", HOLD: "var(--yellow)" };
-      ema.rows.forEach(function (r) {
-        Object.keys(r.row_pct).forEach(function (signal) {
-          barItems.push({ label: r.state + " -> " + signal, value: r.row_pct[signal], signal: signal });
-        });
-      });
-      renderBarChart(document.getElementById("ema-bar-chart"), barItems, {
-        valueFormat: function (v) { return fmt(v, 1) + "%"; },
-        colorFn: function (v, label, item) { return signalColors[item.signal] || "var(--accent)"; },
-      });
-
-      var rows = [];
-      ema.rows.forEach(function (r) {
-        Object.keys(r.row_pct).forEach(function (signal) {
-          rows.push({ state: r.state, signal: signal, count: r.counts[signal], row_pct: r.row_pct[signal] });
-        });
-      });
-      renderDataTable(document.getElementById("ema-table-container"), rows, [
-        { key: "state", label: "State", text: true },
-        { key: "signal", label: "Signal", text: true },
-        { key: "count", label: "Count" },
-        { key: "row_pct", label: "Row %", format: function (v) { return fmt(v, 1) + "%"; } },
-      ], { pageSize: 20, defaultSort: "state", defaultDir: "asc" });
-    }
   }
 
-  function renderRelevance(report) {
-    var rows = report.relevance || [];
-    renderDataTable(document.getElementById("relevance-table-container"), rows, [
-      { key: "indicator", label: "Indicator", text: true },
-      { key: "dir_accuracy_pct", label: "dir_acc%", format: function (v) { return fmt(v, 1); } },
+  // Shared by both the Indicator and Price Action tabs - same methodology, same
+  // columns, just a different column set analyzed (technical indicators vs sig_*
+  // price-action signals), so the two reports are directly comparable.
+  function renderRelevanceTable(container, rows) {
+    renderDataTable(container, rows, [
+      { key: "indicator", label: "Name", text: true },
+      { key: "fires", label: "fires" },
+      { key: "hit_rate_pct", label: "hit_rate%", format: function (v) { return fmt(v, 1); } },
       { key: "buy_match_pct", label: "buy_match%", format: function (v) { return fmt(v, 1); } },
       { key: "sell_match_pct", label: "sell_match%", format: function (v) { return fmt(v, 1); } },
       { key: "move_rate_pct", label: "move_%", format: function (v) { return fmt(v, 1); } },
       { key: "corr_value", label: "corr_val", format: function (v) { return fmt(v, 3); } },
       { key: "corr_change", label: "corr_chg", format: function (v) { return fmt(v, 3); } },
-      { key: "samples", label: "n" },
     ], { defaultSort: "relevance_score", defaultDir: "desc" });
   }
 
-  function renderConditions(report) {
-    var cs = report.condition_search;
-    if (!cs) return;
-    var subtabs = document.getElementById("condition-subtabs");
-    var container = document.getElementById("condition-table-container");
-    var targets = Object.keys(cs);
+  function renderRelevance(report) {
+    renderRelevanceTable(document.getElementById("relevance-table-container"), report.indicator_relevance || []);
+  }
 
-    function showTarget(target) {
-      subtabs.querySelectorAll("button").forEach(function (b) {
-        b.classList.toggle("active", b.getAttribute("data-target") === target);
-      });
-      var data = cs[target];
-      renderDataTable(container, data.combinations, [
-        { key: "conditions", label: "Conditions (" + target + ", base rate " + fmt(data.base_rate_pct, 1) + "%)", text: true },
-        { key: "size", label: "size" },
-        { key: "support", label: "support" },
-        { key: "precision_pct", label: "precision%", format: function (v) { return fmt(v, 1); } },
-        { key: "lift", label: "lift", format: function (v) { return fmt(v, 2) + "x"; } },
-      ], { defaultSort: "precision_pct", defaultDir: "desc" });
+  function renderCombo(report) {
+    var cb = report.combo_backtest;
+    var cfgContainer = document.getElementById("combo-config-cards");
+    if (!cb) {
+      cfgContainer.appendChild(el("p", { class: "note" }, ["Combo backtest was not run."]));
+      return;
     }
 
-    targets.forEach(function (target, idx) {
-      var btn = el("button", { "data-target": target }, [target]);
-      if (idx === 0) btn.classList.add("active");
-      btn.addEventListener("click", function () { showTarget(target); });
-      subtabs.appendChild(btn);
+    var cfg = cb.config;
+    var pairs = [
+      ["Combo sizes", cfg.min_combo_size + " - " + cfg.max_combo_size],
+      ["Min fires", cfg.min_fires],
+      ["Long pool", cfg.long_pool_size + " conditions/signals"],
+      ["Short pool", cfg.short_pool_size + " conditions/signals"],
+      ["Combos tested", (cfg.combos_tested || 0).toLocaleString()],
+      ["Cleared min fires", (cfg.combos_cleared_min_fires || 0).toLocaleString()],
+      ["Simulated", (cfg.combos_simulated || 0).toLocaleString()],
+    ];
+    pairs.forEach(function (pair) {
+      cfgContainer.appendChild(el("div", { class: "card" }, [
+        el("div", { class: "label" }, [pair[0]]),
+        el("div", { class: "value" }, [String(pair[1])]),
+      ]));
     });
-    if (targets.length) showTarget(targets[0]);
+
+    var combos = cb.combinations || [];
+
+    var calloutContainer = document.getElementById("combo-best-callout");
+    var initialCapital = (report.config && report.config.backtest_initial_capital) || 100;
+    if (combos.length) {
+      var best = combos[0];
+      calloutContainer.appendChild(el("div", {}, [
+        el("strong", {}, ["Best combination (max profit / capital growth): "]),
+        best.combo + " — $" + fmt(initialCapital, 0) + " grew to $" + fmt(best.final_equity, 2) +
+          " (" + (best.return_pct >= 0 ? "+" : "") + fmt(best.return_pct, 1) + "%) over " + best.trades +
+          " trades, " + fmt(best.win_rate_pct, 1) + "% win rate.",
+      ]));
+    } else {
+      calloutContainer.appendChild(el("div", {}, ["No profitable combination found."]));
+    }
+
+    var topCombos = combos.slice(0, 10).map(function (r) { return { label: r.combo, value: r.total_pnl }; });
+    renderBarChart(document.getElementById("combo-bar-chart"), topCombos, {
+      valueFormat: function (v) { return (v >= 0 ? "+" : "") + fmt(v, 2); },
+    });
+
+    renderDataTable(document.getElementById("combo-table-container"), combos, [
+      { key: "combo", label: "Combo", text: true },
+      { key: "size", label: "size" },
+      { key: "fires", label: "fires" },
+      { key: "trades", label: "trades" },
+      { key: "win_rate_pct", label: "win_rate%", format: function (v) { return fmt(v, 1); } },
+      { key: "final_equity", label: "final_$", format: function (v) { return fmt(v, 2); } },
+      { key: "total_pnl", label: "total_pnl", format: function (v) { return fmt(v, 2); }, colorize: true },
+      { key: "return_pct", label: "return%", format: function (v) { return fmt(v, 1); }, colorize: true },
+    ], { defaultSort: "total_pnl", defaultDir: "desc" });
   }
 
   function renderPriceAction(report) {
-    var rows = (report.price_action_evaluation || []).filter(function (r) { return r.hit_rate !== null && r.hit_rate !== undefined; });
-    renderDataTable(document.getElementById("priceaction-table-container"), rows, [
-      { key: "signal", label: "Signal", text: true },
-      { key: "fires", label: "fires" },
-      { key: "hit_rate", label: "hit_rate%", format: function (v) { return fmt(v * 100, 1); } },
-      { key: "avg_R", label: "avg_R", format: function (v) { return fmt(v, 3); }, colorize: true },
-      { key: "expectancy_R", label: "expectancy_R", format: function (v) { return fmt(v, 3); }, colorize: true },
-    ], { defaultSort: "expectancy_R", defaultDir: "desc" });
+    renderRelevanceTable(document.getElementById("priceaction-table-container"), report.price_action_relevance || []);
   }
 
   function renderBacktest(report) {
@@ -744,69 +744,6 @@
     ], { defaultSort: "total_pnl_no_fees", defaultDir: "desc", pageSize: 24 });
   }
 
-  function renderPortfolio(report) {
-    var body = document.getElementById("portfolio-body");
-    var chartContainer = document.getElementById("portfolio-equity-chart");
-    var pf = report.portfolio;
-    if (!pf) {
-      body.appendChild(el("p", { class: "note" }, ["Portfolio step was not run."]));
-      chartContainer.appendChild(el("p", { class: "note" }, ["No data."]));
-      return;
-    }
-    if (!pf.signals_used || !pf.signals_used.length) {
-      body.appendChild(el("p", { class: "note" }, [pf.message || "No standalone-profitable signals found."]));
-      chartContainer.appendChild(el("p", { class: "note" }, ["No data."]));
-      return;
-    }
-
-    var summary = pf.summary;
-    var cards = el("div", { class: "cards" });
-    [
-      ["Signals used", pf.signals_used.join(", ")],
-      ["Total trades", summary.trades],
-      ["Win rate", fmt(summary.win_rate_pct, 1) + "%"],
-      ["Final equity", "$" + fmt(summary.final_equity, 2)],
-      ["Total PnL", (summary.total_pnl >= 0 ? "+" : "") + fmt(summary.total_pnl, 2)],
-      ["Max drawdown", fmt(summary.max_drawdown_pct, 1) + "%"],
-    ].forEach(function (pair) {
-      var valueClass = "value";
-      if (pair[0] === "Total PnL") valueClass += summary.total_pnl >= 0 ? " green" : " red";
-      cards.appendChild(el("div", { class: "card" }, [
-        el("div", { class: "label" }, [pair[0]]),
-        el("div", { class: valueClass }, [String(pair[1])]),
-      ]));
-    });
-    body.appendChild(cards);
-
-    body.appendChild(el("h2", {}, ["Exit reasons"]));
-    var barsPanel = el("div", { class: "panel" });
-    body.appendChild(barsPanel);
-    var totalExits = Object.keys(pf.exit_reasons).reduce(function (s, k) { return s + pf.exit_reasons[k]; }, 0);
-    renderBarChart(
-      barsPanel,
-      Object.keys(pf.exit_reasons).map(function (reason) { return { label: reason, value: pf.exit_reasons[reason] }; }),
-      {
-        valueFormat: function (v) { return v + " (" + (totalExits ? (v / totalExits * 100).toFixed(1) : 0) + "%)"; },
-        colorFn: function () { return "var(--accent)"; },
-      }
-    );
-
-    body.appendChild(el("h2", {}, ["Contribution per signal"]));
-    var tableContainer = el("div");
-    body.appendChild(tableContainer);
-    renderDataTable(tableContainer, pf.per_signal_contribution || [], [
-      { key: "signal", label: "Signal", text: true },
-      { key: "trades", label: "trades" },
-      { key: "pnl", label: "pnl", format: function (v) { return fmt(v, 2); }, colorize: true },
-    ], { defaultSort: "pnl", defaultDir: "desc", pageSize: 20 });
-
-    if (pf.equity_curve && pf.equity_curve.length > 1) {
-      renderLineChart(chartContainer, pf.equity_curve, { label: "equity $", baseline: report.config.backtest_initial_capital });
-    } else {
-      chartContainer.appendChild(el("p", { class: "note" }, ["No equity curve data."]));
-    }
-  }
-
   // ------------------------------------------------------------------
   // Boot
   // ------------------------------------------------------------------
@@ -816,10 +753,9 @@
     renderOverview(report);
     renderOracle(report);
     renderRelevance(report);
-    renderConditions(report);
     renderPriceAction(report);
     renderBacktest(report);
-    renderPortfolio(report);
+    renderCombo(report);
     document.getElementById("app").style.display = "block";
   }
 

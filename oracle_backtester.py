@@ -11,6 +11,9 @@ stop/target/fee/risk setup. Every real (non-lookahead) signal in this project
 should be judged against this ceiling, never expected to beat it.
 """
 
+from rich.console import Console
+from rich.table import Table
+
 from backtester import Backtester
 from portfolio_manager import PortfolioManager
 
@@ -80,24 +83,32 @@ class OracleBacktester:
 
     def print_report(self):
         standalone, managed = self.run()
+        console = Console(width=220)
 
-        print("\n" + "=" * 100)
-        print("ORACLE CEILING BACKTEST - NOT a tradeable strategy (uses future-looking data)")
-        print("=" * 100)
-        print(
-            "oracle_signal is built from the NEXT lookahead candles' real high/low - it already\n"
-            "knows the future. This is the theoretical BEST CASE under this bracket/fee setup - a\n"
-            "ceiling to judge real signals against, not something you can trade live."
+        console.print("\n[bold yellow]ORACLE CEILING BACKTEST[/bold yellow] - NOT a tradeable strategy (uses future-looking data)")
+        console.print(
+            "oracle_signal is built from the NEXT lookahead candles' real high/low - it already knows the "
+            "future. This is the theoretical BEST CASE under this bracket/fee setup - a ceiling to judge "
+            "real signals against, not something you can trade live."
         )
-        print(
-            f"\nStandalone (no risk management) : {standalone['trades']} trades, "
-            f"{standalone['win_rate_pct']}% win rate, ${standalone['final_equity']} final "
-            f"(${standalone['total_pnl']:+.2f})"
-        )
-        print(
-            f"Portfolio-managed (drawdown throttle etc.): {managed['trades']} trades, "
-            f"{managed['win_rate_pct']}% win rate, ${managed['final_equity']} final "
-            f"(${managed['total_pnl']:+.2f}), max drawdown {managed['max_drawdown_pct']}%"
-        )
-        print("=" * 100 + "\n")
+
+        table = Table(show_lines=False)
+        table.add_column("Mode", style="bold")
+        table.add_column("trades", justify="right")
+        table.add_column("win_rate%", justify="right")
+        table.add_column("final_$", justify="right")
+        table.add_column("total_pnl", justify="right")
+        table.add_column("max_dd%", justify="right")
+
+        for label, stats in [("Standalone (no risk mgmt)", standalone), ("Portfolio-managed (drawdown throttle etc.)", managed)]:
+            pnl_style = "green" if stats["total_pnl"] > 0 else "red"
+            table.add_row(
+                label,
+                str(stats["trades"]),
+                f"{stats['win_rate_pct']}",
+                f"{stats['final_equity']:.2f}",
+                f"[{pnl_style}]{stats['total_pnl']:+.2f}[/{pnl_style}]",
+                f"{stats.get('max_drawdown_pct', '-')}",
+            )
+        console.print(table)
         return standalone, managed
