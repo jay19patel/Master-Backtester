@@ -24,9 +24,17 @@ short half (`col == -1`).
 
 Performance: requiring several conditions/signals to ALL be true on the same
 candle is combinatorially rare, and the full pool is large (~160
-conditions/signals per direction). Combo sizes are capped at 1-2 by default
-(every single condition plus every pair) to keep the search to tens of
-thousands of combinations instead of tens of millions - a cheap vectorized
+conditions/signals per direction) - exhaustively trying every combination
+stops being feasible past size 2 (C(160,3) is already 670K per direction,
+size 5 is billions). Sizes 1-2 are still searched exhaustively (every single
+condition, every pair - nothing skipped). Beyond that, a greedy beam search
+takes over: the best `beam_width` combos from the previous size (by total
+PnL) are each extended with every remaining pool item to form the next size,
+and only the best `beam_width` of those survive to extend again. This is how
+a 5-way combo like "golden_pullback(L) AND squeeze_breakout(L) AND
+trend_confluence(L) AND fib_extension(L) AND return_20>median" becomes
+reachable without exhaustively testing all ~200 billion 5-way combinations -
+it's built up one profitable step at a time instead. A cheap vectorized
 fire-count check runs first for every combination; only the ones clearing
 `min_fires` go through the much more expensive bar-by-bar trade simulation.
 """
@@ -66,6 +74,7 @@ class ComboBacktester:
         min_fires=15,
         console_top_n=25,
         condition_window=100,
+        beam_width=150,
     ):
         self.df = df
         self.min_combo_size = min_combo_size
@@ -73,6 +82,7 @@ class ComboBacktester:
         self.min_fires = min_fires
         self.console_top_n = console_top_n
         self.condition_window = condition_window
+        self.beam_width = beam_width
         self.backtester = Backtester(
             df,
             initial_capital=initial_capital,
@@ -124,9 +134,45 @@ class ComboBacktester:
     # ------------------------------------------------------------------
     # Search + backtest
     # ------------------------------------------------------------------
+    def _evaluate(self, combo, size, combined_mask, direction):
+        """Fire-count pre-filter, then (if it clears) the real bar-by-bar
+        simulation. Returns (row_dict_or_None). Always increments
+        combos_tested; increments combos_cleared_min_fires/combos_simulated
+        only as it clears each stage."""
+        self.stats["combos_tested"] += 1
+        fires = int(np.count_nonzero(combined_mask))
+        if fires < self.min_fires:
+            return None
+        self.stats["combos_cleared_min_fires"] += 1
+
+        direction_array = np.where(combined_mask, direction, 0)
+        trades, final_equity = self.backtester.simulate_direction_array(direction_array)
+        self.stats["combos_simulated"] += 1
+
+        n_trades = len(trades)
+        if n_trades < self.min_fires:
+            return None
+
+        wins = [t for t in trades if t["pnl"] > 0]
+        total_pnl = final_equity - self.backtester.initial_capital
+        return {
+            "combo": " AND ".join(combo),
+            "size": size,
+            "fires": fires,
+            "trades": n_trades,
+            "win_rate_pct": round(len(wins) / n_trades * 100, 1),
+            "final_equity": round(final_equity, 2),
+            "total_pnl": round(total_pnl, 2),
+            "return_pct": round(total_pnl / self.backtester.initial_capital * 100, 1),
+        }
+
     def run(self):
-        """Backtest every qualifying combination. Returns a DataFrame (both
-        winning and losing combos that cleared min_fires), best PnL first."""
+        """Backtest every qualifying combination. Sizes 1-2 are searched
+        exhaustively; sizes 3+ (if max_combo_size allows) are built with a
+        greedy beam search on top of the exhaustive size-2 results, since
+        exhaustively trying every larger combination is computationally
+        infeasible with a ~160-item pool. Returns a DataFrame (both winning
+        and losing combos that cleared min_fires), best PnL first."""
         long_pool, short_pool = self._build_pools()
         self.stats = {
             "long_pool_size": len(long_pool),
@@ -137,44 +183,55 @@ class ComboBacktester:
         }
 
         rows = []
+        exhaustive_max_size = min(self.max_combo_size, 2)
+
         for direction, pool in ((1, long_pool), (-1, short_pool)):
             names = list(pool.keys())
-            for size in range(self.min_combo_size, self.max_combo_size + 1):
-                for combo in itertools.combinations(names, size):
-                    self.stats["combos_tested"] += 1
+            frontier = []  # [(combo_names_tuple, combined_mask, row_dict), ...] to extend beyond size 2
 
+            for size in range(self.min_combo_size, exhaustive_max_size + 1):
+                size_survivors = []
+                for combo in itertools.combinations(names, size):
                     combined_mask = pool[combo[0]]
                     for name in combo[1:]:
                         combined_mask = combined_mask & pool[name]
 
-                    fires = int(np.count_nonzero(combined_mask))
-                    if fires < self.min_fires:
+                    row = self._evaluate(combo, size, combined_mask, direction)
+                    if row is None:
                         continue
-                    self.stats["combos_cleared_min_fires"] += 1
+                    rows.append(row)
+                    size_survivors.append((combo, combined_mask, row))
 
-                    direction_array = np.where(combined_mask, direction, 0)
-                    trades, final_equity = self.backtester.simulate_direction_array(direction_array)
-                    self.stats["combos_simulated"] += 1
+                if size == exhaustive_max_size:
+                    size_survivors.sort(key=lambda item: item[2]["total_pnl"], reverse=True)
+                    frontier = size_survivors[: self.beam_width]
 
-                    n_trades = len(trades)
-                    if n_trades < self.min_fires:
-                        continue
+            # Greedy beam expansion for sizes beyond the exhaustive cutoff.
+            for size in range(exhaustive_max_size + 1, self.max_combo_size + 1):
+                if not frontier:
+                    break
+                candidates = []
+                seen_keys = set()
+                for combo_names, mask, _ in frontier:
+                    used = set(combo_names)
+                    for name in names:
+                        if name in used:
+                            continue
+                        new_combo = combo_names + (name,)
+                        key = tuple(sorted(new_combo))
+                        if key in seen_keys:
+                            continue
+                        seen_keys.add(key)
 
-                    wins = [t for t in trades if t["pnl"] > 0]
-                    total_pnl = final_equity - self.backtester.initial_capital
+                        combined_mask = mask & pool[name]
+                        row = self._evaluate(new_combo, size, combined_mask, direction)
+                        if row is None:
+                            continue
+                        rows.append(row)
+                        candidates.append((new_combo, combined_mask, row))
 
-                    rows.append(
-                        {
-                            "combo": " AND ".join(combo),
-                            "size": size,
-                            "fires": fires,
-                            "trades": n_trades,
-                            "win_rate_pct": round(len(wins) / n_trades * 100, 1),
-                            "final_equity": round(final_equity, 2),
-                            "total_pnl": round(total_pnl, 2),
-                            "return_pct": round(total_pnl / self.backtester.initial_capital * 100, 1),
-                        }
-                    )
+                candidates.sort(key=lambda item: item[2]["total_pnl"], reverse=True)
+                frontier = candidates[: self.beam_width]
 
         result = pd.DataFrame(rows)
         if not result.empty:
@@ -185,10 +242,16 @@ class ComboBacktester:
         result = self.run()
         console = Console(width=220)
 
+        search_note = (
+            f"sizes 1-2 exhaustive, sizes 3-{self.max_combo_size} via greedy beam search "
+            f"(top {self.beam_width} carried forward each step)"
+            if self.max_combo_size > 2
+            else f"sizes {self.min_combo_size}-{self.max_combo_size} exhaustive"
+        )
         console.print(
             f"[bold]COMBO BACKTEST[/bold] - long pool {self.stats['long_pool_size']}, "
-            f"short pool {self.stats['short_pool_size']} conditions/signals, combo sizes "
-            f"{self.min_combo_size}-{self.max_combo_size}, min {self.min_fires} fires kept"
+            f"short pool {self.stats['short_pool_size']} conditions/signals, combo {search_note}, "
+            f"min {self.min_fires} fires kept"
         )
         console.print(
             f"Search funnel: {self.stats['combos_tested']:,} tested -> "

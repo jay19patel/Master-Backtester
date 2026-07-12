@@ -27,7 +27,7 @@ from report_exporter import ReportExporter
 pd.set_option("display.max_columns", None)
 pd.set_option("display.width", 200)
 
-SYMBOL = "BTCUSD"
+SYMBOL = "ETHUSD"
 INTERVAL = "1h"
 TOTAL_DAYS = 365
 ORACLE_LOOKAHEAD = 20
@@ -39,16 +39,17 @@ RUN_RELEVANCE_ANALYSIS = True
 RUN_BACKTEST = True
 BACKTEST_INITIAL_CAPITAL = 100.0
 BACKTEST_RISK_PER_TRADE_PCT = 2.0
-BACKTEST_STOP_LOSS_PCT = 1  # 0.5% stop-loss
-BACKTEST_TAKE_PROFIT_PCT = 2  # 1% target -> 1:2 reward:risk
+BACKTEST_STOP_LOSS_PCT = 1  # 1% stop-loss
+BACKTEST_TAKE_PROFIT_PCT = 3  # 2% target -> 1:2 reward:risk, matches ORACLE_MIN_REWARD_RISK_RATIO
 BACKTEST_MAX_HOLD_BARS = 20
 BACKTEST_FEE_PCT = 0.05
 
 RUN_COMBO_BACKTEST = True
 COMBO_MIN_SIZE = 1
-COMBO_MAX_SIZE = 2  # pool covers ALL indicators + ALL sig_* signals; capped at pairs to keep runtime sane
+COMBO_MAX_SIZE = 10  # sizes 1-2 exhaustive over the full pool; 3-10 via greedy beam search (see ComboBacktester)
 COMBO_MIN_FIRES = 15
 COMBO_CONSOLE_TOP_N = 10
+COMBO_BEAM_WIDTH = 150
 
 RUN_ORACLE_BACKTEST = True
 # Oracle Ceiling internally compares standalone vs a portfolio-risk-managed run
@@ -164,6 +165,7 @@ def main():
             max_combo_size=COMBO_MAX_SIZE,
             min_fires=COMBO_MIN_FIRES,
             console_top_n=COMBO_CONSOLE_TOP_N,
+            beam_width=COMBO_BEAM_WIDTH,
         ).print_report()
 
     if RUN_ORACLE_BACKTEST:
@@ -209,6 +211,7 @@ def export_config():
         "combo_min_size": COMBO_MIN_SIZE,
         "combo_max_size": COMBO_MAX_SIZE,
         "combo_min_fires": COMBO_MIN_FIRES,
+        "combo_beam_width": COMBO_BEAM_WIDTH,
         "run_oracle_backtest": RUN_ORACLE_BACKTEST,
         "portfolio_max_concurrent_trades": PORTFOLIO_MAX_CONCURRENT_TRADES,
         "portfolio_risk_cap_pct": PORTFOLIO_RISK_CAP_PCT,

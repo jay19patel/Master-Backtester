@@ -191,16 +191,18 @@ class ReportExporter:
             max_hold_bars=self.config["backtest_max_hold_bars"],
             fee_pct=self.config["backtest_fee_pct"],
             min_combo_size=self.config.get("combo_min_size", 1),
-            max_combo_size=self.config.get("combo_max_size", 4),
+            max_combo_size=self.config.get("combo_max_size", 2),
             min_fires=self.config.get("combo_min_fires", 15),
+            beam_width=self.config.get("combo_beam_width", 150),
         )
         result = combo_bt.run()
         profitable = result[result["total_pnl"] > 0] if not result.empty else result
         return {
             "config": {
                 "min_combo_size": self.config.get("combo_min_size", 1),
-                "max_combo_size": self.config.get("combo_max_size", 4),
+                "max_combo_size": self.config.get("combo_max_size", 2),
                 "min_fires": self.config.get("combo_min_fires", 15),
+                "beam_width": self.config.get("combo_beam_width", 150),
                 **combo_bt.stats,
             },
             "combinations": records(profitable),

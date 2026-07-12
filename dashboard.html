@@ -687,6 +687,57 @@
     ], { defaultSort: "total_pnl", defaultDir: "desc" });
   }
 
+  function renderOracleCeiling(report) {
+    var ob = report.oracle_backtest;
+    var warningContainer = document.getElementById("oracle-ceiling-warning");
+    var cardsContainer = document.getElementById("oracle-ceiling-cards");
+    var chartContainer = document.getElementById("oracle-ceiling-chart");
+    if (!ob) {
+      cardsContainer.appendChild(el("p", { class: "note" }, ["Oracle ceiling backtest was not run."]));
+      return;
+    }
+
+    warningContainer.appendChild(el("div", {}, [el("strong", {}, ["Not tradeable: "]), ob.warning]));
+
+    var standalone = ob.standalone;
+    var managed = ob.managed;
+
+    function pnlValue(v) {
+      return el("div", { class: "value " + (v >= 0 ? "green" : "red") }, [(v >= 0 ? "+" : "") + fmt(v, 2)]);
+    }
+
+    var cardDefs = [
+      ["Trades", standalone.trades + " vs " + managed.trades],
+      ["Win rate%", fmt(standalone.win_rate_pct, 1) + "% vs " + fmt(managed.win_rate_pct, 1) + "%"],
+      ["Final $ - standalone", "$" + fmt(standalone.final_equity, 2)],
+      ["Final $ - managed", "$" + fmt(managed.final_equity, 2)],
+      ["Max drawdown% - managed", fmt(managed.max_drawdown_pct, 1) + "%"],
+    ];
+    cardDefs.forEach(function (pair) {
+      cardsContainer.appendChild(el("div", { class: "card" }, [
+        el("div", { class: "label" }, [pair[0]]),
+        el("div", { class: "value" }, [String(pair[1])]),
+      ]));
+    });
+    cardsContainer.appendChild(el("div", { class: "card" }, [
+      el("div", { class: "label" }, ["Total PnL - standalone"]),
+      pnlValue(standalone.total_pnl),
+    ]));
+    cardsContainer.appendChild(el("div", { class: "card" }, [
+      el("div", { class: "label" }, ["Total PnL - managed"]),
+      pnlValue(managed.total_pnl),
+    ]));
+
+    if (managed.equity_curve && managed.equity_curve.length > 1) {
+      var initialCapital = (report.config && report.config.backtest_initial_capital) || 100;
+      renderLineChart(chartContainer, managed.equity_curve, {
+        label: "equity $", baseline: initialCapital,
+      });
+    } else {
+      chartContainer.appendChild(el("p", { class: "note" }, ["Not enough data to chart."]));
+    }
+  }
+
   function renderPriceAction(report) {
     renderRelevanceTable(document.getElementById("priceaction-table-container"), report.price_action_relevance || []);
   }
@@ -756,6 +807,7 @@
     renderPriceAction(report);
     renderBacktest(report);
     renderCombo(report);
+    renderOracleCeiling(report);
     document.getElementById("app").style.display = "block";
   }
 
