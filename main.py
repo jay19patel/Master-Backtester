@@ -1,17 +1,17 @@
-"""Entry point: fetch data, build the features these 25 strategies need,
+"""Entry point: fetch data, build the features the active strategy(ies) need,
 backtest each one independently AND together on one portfolio-managed
-account, and save the results.
+account, and save the results (including the full trade-by-trade order log).
 
 This branch is intentionally lean - 4 files:
     data_fetcher.py      - fetch/cache OHLCV data
     backtester.py         - realistic single-strategy simulation engine
-    portfolio_manager.py  - risk-managed simulation of all 25 together (concurrent-
-                             position cap, portfolio risk cap, drawdown throttle)
-    strategies.py         - the 25 strategies + the feature engineering they need
+    portfolio_manager.py  - risk-managed simulation of the active strategies together
+                             (concurrent-position cap, portfolio risk cap, drawdown throttle)
+    strategies.py         - all 25 candidate strategies + the feature engineering they need
 
-main.py itself is just the glue: fetch -> build features -> backtest each of
-the 25 strategies standalone, then all 25 together under PortfolioManager ->
-save results.json / results.csv.
+main.py itself is just the glue: fetch -> build features -> backtest each
+ACTIVE strategy standalone (with its full trade log) -> all of them together
+under PortfolioManager -> save results.json / results.csv / trades.csv.
 """
 
 import json
@@ -30,6 +30,12 @@ SYMBOL = "ETHUSD"
 INTERVAL = "1h"
 TOTAL_DAYS = 365
 
+# Which of the 25 candidate strategies (defined in strategies.py) to actually
+# trade. strategy_01 was the single best performer of the diverse-strategy
+# search (see strategies.py) - narrowed to just this one for close inspection
+# of its trade-by-trade behavior. Add more names back here to trade a basket.
+ACTIVE_STRATEGY_NAMES = ["strategy_01"]
+
 BACKTEST_INITIAL_CAPITAL = 100.0
 BACKTEST_RISK_PER_TRADE_PCT = 2.0
 BACKTEST_STOP_LOSS_PCT = 1
@@ -37,7 +43,7 @@ BACKTEST_TAKE_PROFIT_PCT = 3
 BACKTEST_MAX_HOLD_BARS = 20
 BACKTEST_FEE_PCT = 0.05
 
-# PortfolioManager risk-management knobs for the "all 25 together" run.
+# PortfolioManager risk-management knobs for the "all active strategies together" run.
 PORTFOLIO_MAX_CONCURRENT_TRADES = 5
 PORTFOLIO_RISK_CAP_PCT = 10.0
 PORTFOLIO_DRAWDOWN_THROTTLE_TRIGGER_PCT = 10.0
@@ -46,6 +52,7 @@ PORTFOLIO_THROTTLED_RISK_PCT = 1.0
 
 RESULTS_JSON_PATH = "results.json"
 RESULTS_CSV_PATH = "results.csv"
+TRADES_CSV_PATH = "trades.csv"
 
 
 def build_dataset():
@@ -58,12 +65,16 @@ def build_dataset():
 def build_strategy_direction_arrays(df):
     """Computed ONCE and reused for both the standalone and portfolio-managed
     runs below, since building a direction array does real work (rolling
-    medians etc.) per strategy."""
-    return [{"name": s["name"], "combo": s["combo"], "direction_array": build_direction_array(df, s)} for s in STRATEGIES]
+    medians etc.) per strategy. Only ACTIVE_STRATEGY_NAMES are built."""
+    active = [s for s in STRATEGIES if s["name"] in ACTIVE_STRATEGY_NAMES]
+    missing = set(ACTIVE_STRATEGY_NAMES) - {s["name"] for s in active}
+    if missing:
+        raise ValueError(f"ACTIVE_STRATEGY_NAMES references unknown strategy name(s): {sorted(missing)}")
+    return [{"name": s["name"], "combo": s["combo"], "direction_array": build_direction_array(df, s)} for s in active]
 
 
 def run_standalone(df, strategy_arrays):
-    """Each of the 25 strategies traded alone on its own account - shows each
+    """Each active strategy traded alone on its own account - shows each
     strategy's raw, un-managed edge."""
     bt = Backtester(
         df,
@@ -90,7 +101,7 @@ def run_standalone(df, strategy_arrays):
 
 
 def run_portfolio(df, strategy_arrays):
-    """All 25 strategies traded together on ONE shared, risk-managed account -
+    """All active strategies traded together on ONE shared, risk-managed account -
     shows what capital growth looks like when position sizing/concurrency/
     drawdown are actively managed across the whole basket, not per-strategy."""
     pm = PortfolioManager(
@@ -114,7 +125,7 @@ def run_portfolio(df, strategy_arrays):
 def print_report(result_df):
     console = Console(width=220)
     console.print(
-        f"\n[bold]STRATEGY BACKTEST[/bold]: {len(STRATEGIES)} independent strategies, each traded on its "
+        f"\n[bold]STRATEGY BACKTEST[/bold]: {len(ACTIVE_STRATEGY_NAMES)} active strategy(ies), each traded on its "
         f"own ${BACKTEST_INITIAL_CAPITAL:.0f} starting balance"
     )
     console.print(
@@ -126,7 +137,7 @@ def print_report(result_df):
         console.print("\nNo strategy produced any trades.")
         return
 
-    table = Table(title=f"All {len(result_df)} strategies, ranked by total PnL", show_lines=False)
+    table = Table(title=f"All {len(result_df)} active strategies, ranked by total PnL", show_lines=False)
     table.add_column("#", justify="right", style="dim")
     table.add_column("Strategy", style="bold")
     table.add_column("trades", justify="right")
@@ -158,6 +169,44 @@ def print_report(result_df):
     )
 
 
+def print_trade_log(name, trade_log):
+    """Full order-by-order history for one strategy: every entry/exit price,
+    stop-loss, target, timing, and outcome - not just aggregate stats."""
+    console = Console(width=220)
+    console.print(f"\n[bold]TRADE LOG[/bold]: {name} - every order taken, in sequence")
+
+    table = Table(show_lines=False)
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("Direction", style="bold")
+    table.add_column("Entry time")
+    table.add_column("Exit time")
+    table.add_column("Entry $", justify="right")
+    table.add_column("Stop $", justify="right")
+    table.add_column("Target $", justify="right")
+    table.add_column("Exit $", justify="right")
+    table.add_column("Exit reason")
+    table.add_column("PnL", justify="right")
+    table.add_column("Equity after", justify="right")
+
+    for i, t in enumerate(trade_log, 1):
+        pnl_style = "green" if t["pnl"] > 0 else "red"
+        dir_style = "green" if t["direction"] == "LONG" else "red"
+        table.add_row(
+            str(i),
+            f"[{dir_style}]{t['direction']}[/{dir_style}]",
+            str(t["entry_time"]),
+            str(t["exit_time"]),
+            f"{t['entry_price']:.4f}",
+            f"{t['stop_price']:.4f}",
+            f"{t['target_price']:.4f}",
+            f"{t['exit_price']:.4f}",
+            t["exit_reason"],
+            f"[{pnl_style}]{t['pnl']:+.2f}[/{pnl_style}]",
+            f"{t['equity_after']:.2f}",
+        )
+    console.print(table)
+
+
 def save_results(standalone_df, portfolio_trades, portfolio_equity, portfolio_curve):
     portfolio_wins = [t for t in portfolio_trades if t["pnl"] > 0]
     portfolio_section = {
@@ -167,6 +216,7 @@ def save_results(standalone_df, portfolio_trades, portfolio_equity, portfolio_cu
         "total_pnl": round(portfolio_equity - BACKTEST_INITIAL_CAPITAL, 2),
         "max_drawdown_pct": round(PortfolioManager._max_drawdown_pct(portfolio_curve), 1),
         "equity_curve": [round(v, 2) for v in portfolio_curve],
+        "trade_log": portfolio_trades,
         "config": {
             "max_concurrent_trades": PORTFOLIO_MAX_CONCURRENT_TRADES,
             "portfolio_risk_cap_pct": PORTFOLIO_RISK_CAP_PCT,
@@ -194,8 +244,16 @@ def save_results(standalone_df, portfolio_trades, portfolio_equity, portfolio_cu
     }
     with open(RESULTS_JSON_PATH, "w") as f:
         json.dump(payload, f, indent=2, default=str)
-    standalone_df.drop(columns=["equity_curve"]).to_csv(RESULTS_CSV_PATH, index=False)
-    print(f"[main] Saved -> {RESULTS_JSON_PATH}, {RESULTS_CSV_PATH}")
+    standalone_df.drop(columns=["equity_curve", "trade_log"]).to_csv(RESULTS_CSV_PATH, index=False)
+
+    # Flattened per-trade order log (every active strategy's trades, one row each).
+    all_trades = []
+    for _, row in standalone_df.iterrows():
+        for t in row["trade_log"]:
+            all_trades.append({"strategy": row["name"], **t})
+    pd.DataFrame(all_trades).to_csv(TRADES_CSV_PATH, index=False)
+
+    print(f"[main] Saved -> {RESULTS_JSON_PATH}, {RESULTS_CSV_PATH}, {TRADES_CSV_PATH}")
 
 
 def main():
@@ -204,6 +262,8 @@ def main():
 
     standalone_df = run_standalone(df, strategy_arrays)
     print_report(standalone_df)
+    for _, row in standalone_df.iterrows():
+        print_trade_log(row["name"], row["trade_log"])
 
     _, (portfolio_trades, portfolio_equity, portfolio_curve) = run_portfolio(df, strategy_arrays)
 

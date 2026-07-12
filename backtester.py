@@ -144,6 +144,11 @@ class Backtester:
                     "entry_time": df.index[entry_i],
                     "exit_time": df.index[exit_i],
                     "direction": "LONG" if direction == 1 else "SHORT",
+                    "entry_price": round(entry_price, 6),
+                    "exit_price": round(exit_price, 6),
+                    "stop_price": round(stop_price, 6),
+                    "target_price": round(target_price, 6),
+                    "position_size": round(position_size, 6),
                     "exit_reason": exit_reason,
                     "pnl": pnl,
                     "equity_after": equity,
@@ -189,6 +194,7 @@ class Backtester:
             "avg_pnl_per_trade": round(total_pnl / n_trades, 3),
             "max_drawdown_pct": round(self._max_drawdown_pct(trades), 1),
             "equity_curve": [round(t["equity_after"], 2) for t in trades],
+            "trade_log": trades,  # full per-trade detail: entry/exit price+time, stop, target, pnl
         }
 
     def run(self, strategies):
