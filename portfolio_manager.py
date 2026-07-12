@@ -1,15 +1,15 @@
-"""PortfolioManager: trades multiple signals together on ONE shared account, with
-portfolio-level risk controls a single-signal backtest can't show at all.
+"""PortfolioManager: trades multiple strategies together on ONE shared account,
+with portfolio-level risk controls a single-strategy backtest can't show at all.
 
 This does NOT try to raise the win rate - it manages risk and lets winners run
 further, which grows capital even at the same accuracy:
 
   - Concurrent-position cap: limits how many trades can be open at once, so
-    several signals firing together can't all stack risk onto the account
+    several strategies firing together can't all stack risk onto the account
     at the same time.
   - Portfolio-level risk cap: total risk currently "on the table" across every
     open position is capped as a % of equity - on top of the per-trade risk -
-    so simultaneous signals can't compound into an outsized bet.
+    so simultaneous strategies can't compound into an outsized bet.
   - Drawdown throttle: risk-per-trade is automatically cut once the account is
     in a drawdown past a trigger, and restored once it recovers past a lower
     threshold (hysteresis, so it doesn't flip-flop every bar) - the classic
@@ -21,10 +21,12 @@ further, which grows capital even at the same accuracy:
     fixed target instead of extending them), the fixed target is dropped and
     the stop trails `trail_distance_r` behind the best price reached instead.
     A strong move can then run well past the original 1:2 target - this grows
-    the AVERAGE WINNER without needing a better win rate.
+    the AVERAGE WINNER without needing a better win rate. OFF by default (see
+    `use_trailing_stop`).
 
 Usage:
-    PortfolioManager(df, signals=["sig_choch", "sig_bos_retest"]).print_report()
+    strategies = [{"name": "strategy_01", "direction_array": arr1}, ...]
+    PortfolioManager(df, strategies).print_report()
 """
 
 import numpy as np
@@ -32,20 +34,18 @@ import pandas as pd
 from rich.console import Console
 from rich.table import Table
 
-from price_action_engine import PriceActionEngine
-
 
 class PortfolioManager:
-    """Backtests a BASKET of signals together on one shared, risk-managed account.
+    """Backtests a BASKET of strategies together on one shared, risk-managed account.
 
     Usage:
-        PortfolioManager(df, signals=[...]).print_report()
+        PortfolioManager(df, strategies).print_report()
     """
 
     def __init__(
         self,
         df,
-        signals,
+        strategies,
         initial_capital=100.0,
         risk_per_trade_pct=2.0,
         stop_loss_pct=0.5,
@@ -63,7 +63,10 @@ class PortfolioManager:
         trail_distance_r=0.5,
     ):
         """
-        signals                     : list of sig_* column names to trade together
+        strategies                   : list of {"name": str, "direction_array": array}
+                                        (same convention as Backtester.run()) - a
+                                        +1/-1/0 direction per candle, one array per
+                                        strategy, all traded together on one account
         risk_per_trade_pct          : normal per-trade risk, % of current equity
         max_concurrent_trades       : hard cap on simultaneously open positions
         portfolio_risk_cap_pct      : max total risk %, summed across all open
@@ -81,7 +84,7 @@ class PortfolioManager:
                                        1:2 target captured - so the default is the
                                        plain fixed stop/target bracket (matches
                                        Backtester exactly). Turn this on to experiment
-                                       - it can still help on a signal whose winners
+                                       - it can still help on a strategy whose winners
                                        genuinely tend to run well past the target.
         breakeven_trigger_r          : (only if use_trailing_stop) move stop to entry
                                        once favorable move reaches this many R
@@ -92,9 +95,9 @@ class PortfolioManager:
         trail_distance_r             : (only if use_trailing_stop) how many R the
                                        trailing stop sits behind the best price reached
         """
-        has_signals = any(c.startswith("sig_") for c in df.columns)
-        self.df = df.copy() if has_signals else PriceActionEngine(df.copy()).build()
-        self.signal_names = [s for s in signals if s in self.df.columns]
+        self.df = df
+        self.strategy_arrays = {s["name"]: np.asarray(s["direction_array"]) for s in strategies}
+        self.strategy_names = list(self.strategy_arrays.keys())
 
         self.initial_capital = initial_capital
         self.risk_per_trade_pct = risk_per_trade_pct
@@ -126,7 +129,7 @@ class PortfolioManager:
         high = df["High"].to_numpy()
         low = df["Low"].to_numpy()
         close = df["Close"].to_numpy()
-        sig_arrays = {name: df[name].to_numpy() for name in self.signal_names}
+        sig_arrays = self.strategy_arrays
 
         equity = self.initial_capital
         peak_equity = equity
@@ -139,7 +142,7 @@ class PortfolioManager:
 
         for i in range(n):
             # 1. Open anything scheduled from the previous bar's signal.
-            for signal_name, direction in pending_entries:
+            for strategy_name, direction in pending_entries:
                 if len(open_positions) >= self.max_concurrent_trades:
                     continue  # slot full - this entry is missed, not queued (realistic)
 
@@ -161,7 +164,7 @@ class PortfolioManager:
 
                 open_positions.append(
                     {
-                        "signal": signal_name,
+                        "strategy": strategy_name,
                         "direction": direction,
                         "entry_i": i,
                         "entry_price": entry_price,
@@ -179,7 +182,7 @@ class PortfolioManager:
 
             # 2. Manage / close open positions using this bar's High/Low.
             still_open = []
-            just_closed_signals = set()
+            just_closed_strategies = set()
             for pos in open_positions:
                 direction = pos["direction"]
                 held = i - pos["entry_i"]
@@ -239,10 +242,10 @@ class PortfolioManager:
                 fee = pos["position_size"] * pos["entry_price"] * (self.fee_pct / 100) * 2
                 pnl = raw_pnl - fee
                 equity += pnl
-                just_closed_signals.add(pos["signal"])
+                just_closed_strategies.add(pos["strategy"])
                 trades.append(
                     {
-                        "signal": pos["signal"],
+                        "strategy": pos["strategy"],
                         "entry_time": df.index[pos["entry_i"]],
                         "exit_time": df.index[i],
                         "direction": "LONG" if direction == 1 else "SHORT",
@@ -263,12 +266,12 @@ class PortfolioManager:
                 throttled = False
 
             # 3. New signals firing on this bar get queued for next bar's open.
-            # A signal that just closed ON THIS bar is not re-checked until the
+            # A strategy that just closed ON THIS bar is not re-checked until the
             # next bar either - matches Backtester, which resumes scanning at
             # exit_i + 1, never re-testing the exit bar itself for a fresh entry.
-            active_signals = {p["signal"] for p in open_positions} | just_closed_signals
+            active_strategies = {p["strategy"] for p in open_positions} | just_closed_strategies
             for name, arr in sig_arrays.items():
-                if name in active_signals:
+                if name in active_strategies:
                     continue
                 direction = arr[i]
                 if direction != 0 and i + 1 < n:
@@ -291,10 +294,9 @@ class PortfolioManager:
         console = Console(width=220)
 
         console.print(
-            f"\n[bold]PORTFOLIO BACKTEST[/bold]: {len(self.signal_names)} signals traded together on one "
+            f"\n[bold]PORTFOLIO BACKTEST[/bold]: {len(self.strategy_names)} strategies traded together on one "
             f"${self.initial_capital:.0f} account"
         )
-        console.print(f"Signals             : {', '.join(self.signal_names)}")
         console.print(
             f"Risk per trade       : {self.risk_per_trade_pct:.1f}% normal, {self.throttled_risk_pct:.1f}% "
             f"while throttled (drawdown >= {self.drawdown_throttle_trigger_pct:.0f}%, "
@@ -313,7 +315,7 @@ class PortfolioManager:
         n_trades = len(trades)
         if n_trades == 0:
             console.print("\nNo trades were taken.")
-            return trades, final_equity
+            return trades, final_equity, equity_curve
 
         wins = [t for t in trades if t["pnl"] > 0]
         win_rate = len(wins) / n_trades * 100
@@ -339,16 +341,16 @@ class PortfolioManager:
             exit_table.add_row(reason, str(count), f"{count / n_trades * 100:.1f}%")
         console.print(exit_table)
 
-        per_signal = pd.DataFrame(trades).groupby("signal")["pnl"].agg(["count", "sum"]).rename(
+        per_strategy = pd.DataFrame(trades).groupby("strategy")["pnl"].agg(["count", "sum"]).rename(
             columns={"count": "trades", "sum": "pnl"}
         )
-        contrib_table = Table(title="Contribution per signal", show_lines=False)
-        contrib_table.add_column("Signal", style="bold")
+        contrib_table = Table(title="Contribution per strategy", show_lines=False)
+        contrib_table.add_column("Strategy", style="bold")
         contrib_table.add_column("trades", justify="right")
         contrib_table.add_column("pnl", justify="right")
-        for name, row in per_signal.sort_values("pnl", ascending=False).iterrows():
+        for name, row in per_strategy.sort_values("pnl", ascending=False).iterrows():
             row_style = "green" if row["pnl"] > 0 else "red"
             contrib_table.add_row(name, str(int(row["trades"])), f"[{row_style}]{row['pnl']:+.2f}[/{row_style}]")
         console.print(contrib_table)
 
-        return trades, final_equity
+        return trades, final_equity, equity_curve

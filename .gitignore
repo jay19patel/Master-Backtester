@@ -12,5 +12,7 @@ wheels/
 # Cached market data
 data/
 
-# Generated report (regenerate with main.py; can balloon past GitHub's 100MB limit)
+# Generated report/results (regenerate with main.py; can balloon past GitHub's 100MB limit)
 report.json
+results.json
+results.csv
