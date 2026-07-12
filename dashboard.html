@@ -244,8 +244,12 @@
       <div class="callout" id="combo-best-callout"></div>
       <h2>Top profitable combinations by total PnL</h2>
       <div class="panel chart-panel" id="combo-bar-chart"></div>
-      <h2>All profitable combinations</h2>
+      <h2 id="combo-table-title">Top profitable combinations</h2>
       <div id="combo-table-container"></div>
+
+      <h2 id="combo-diverse-title">Top 10 independent strategies</h2>
+      <p class="note">The list above is usually one dominant condition wearing several different extra filters - not 10 genuinely different ideas. This picks the best 5-condition combos such that NO TWO share even a single underlying condition, so each row below is a distinct, independent strategy rather than a variation on the same theme.</p>
+      <div id="combo-diverse-table-container"></div>
     </section>
 
     <section class="tab" data-tab="oracleceiling">
@@ -670,6 +674,12 @@
       calloutContainer.appendChild(el("div", {}, ["No profitable combination found."]));
     }
 
+    var titleEl = document.getElementById("combo-table-title");
+    var found = cfg.profitable_combos_found || combos.length;
+    titleEl.textContent = combos.length < found
+      ? "Top " + combos.length.toLocaleString() + " of " + found.toLocaleString() + " profitable combinations"
+      : "All " + combos.length.toLocaleString() + " profitable combinations";
+
     var topCombos = combos.slice(0, 10).map(function (r) { return { label: r.combo, value: r.total_pnl }; });
     renderBarChart(document.getElementById("combo-bar-chart"), topCombos, {
       valueFormat: function (v) { return (v >= 0 ? "+" : "") + fmt(v, 2); },
@@ -685,6 +695,21 @@
       { key: "total_pnl", label: "total_pnl", format: function (v) { return fmt(v, 2); }, colorize: true },
       { key: "return_pct", label: "return%", format: function (v) { return fmt(v, 1); }, colorize: true },
     ], { defaultSort: "total_pnl", defaultDir: "desc" });
+
+    var diverse = cb.diverse_top_combos || [];
+    var diverseTitleEl = document.getElementById("combo-diverse-title");
+    diverseTitleEl.textContent = "Top " + diverse.length + " of " + (cfg.diverse_n_requested || 10) +
+      " requested independent " + (cfg.diverse_size || 5) + "-condition strategies";
+
+    renderDataTable(document.getElementById("combo-diverse-table-container"), diverse, [
+      { key: "combo", label: "Combo", text: true },
+      { key: "fires", label: "fires" },
+      { key: "trades", label: "trades" },
+      { key: "win_rate_pct", label: "win_rate%", format: function (v) { return fmt(v, 1); } },
+      { key: "final_equity", label: "final_$", format: function (v) { return fmt(v, 2); } },
+      { key: "total_pnl", label: "total_pnl", format: function (v) { return fmt(v, 2); }, colorize: true },
+      { key: "return_pct", label: "return%", format: function (v) { return fmt(v, 1); }, colorize: true },
+    ], { defaultSort: "total_pnl", defaultDir: "desc", pageSize: 10 });
   }
 
   function renderOracleCeiling(report) {

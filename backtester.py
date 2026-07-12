@@ -320,5 +320,6 @@ class Backtester:
                 f"${best['final_equity']:.2f} ({best['return_pct']:+.1f}%) over {best['trades']} trades, "
                 f"{best['win_rate_pct']:.1f}% win rate."
             )
+        return result
 
         return result

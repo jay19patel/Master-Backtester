@@ -7,6 +7,15 @@ Usage:
 `config` is a plain dict of every setting main.py already has as module-level
 constants (symbol, interval, backtest/portfolio parameters, which sections to
 run, ...) - this module stays independent of main.py so there's no circular import.
+
+Optionally pass `precomputed` (a dict) with analysis results main.py already
+computed for its own console report - this avoids re-running the same
+(expensive, especially ComboBacktester's search) analysis a second time just
+to export it. Any key left out is computed fresh here instead, so
+ReportExporter still works standalone with just (df, config). Recognized
+keys: indicator_relevance, price_action_relevance (DataFrames), backtester
+(instance) + backtest_result (DataFrame), combo_backtester (instance) +
+combo_profitable (DataFrame), oracle_standalone + oracle_managed (dicts).
 """
 
 import json
@@ -15,7 +24,7 @@ import math
 import pandas as pd
 
 from backtester import Backtester
-from combo_backtester import ComboBacktester
+from combo_backtester import ComboBacktester, diverse_top_combos
 from oracle_backtester import OracleBacktester
 from relevance_analyzer import RelevanceAnalyzer
 
@@ -65,9 +74,10 @@ class ReportExporter:
         ReportExporter(df, config).save("report.json")
     """
 
-    def __init__(self, df, config):
+    def __init__(self, df, config, precomputed=None):
         self.df = df
         self.config = config
+        self.precomputed = precomputed or {}
 
     def _column_groups(self):
         df = self.df
@@ -125,31 +135,38 @@ class ReportExporter:
     def _indicator_relevance_section(self):
         if not self.config.get("run_relevance_analysis"):
             return None
-        _, _, indicator_cols, _ = self._column_groups()
-        result = RelevanceAnalyzer(self.df, columns=indicator_cols, label="Indicator").analyze()
+        result = self.precomputed.get("indicator_relevance")
+        if result is None:
+            _, _, indicator_cols, _ = self._column_groups()
+            result = RelevanceAnalyzer(self.df, columns=indicator_cols, label="Indicator").analyze()
         return records(result)
 
     def _price_action_relevance_section(self):
         if not self.config.get("run_relevance_analysis"):
             return None
-        _, _, _, price_action_cols = self._column_groups()
-        result = RelevanceAnalyzer(self.df, columns=price_action_cols, label="Price Action").analyze()
+        result = self.precomputed.get("price_action_relevance")
+        if result is None:
+            _, _, _, price_action_cols = self._column_groups()
+            result = RelevanceAnalyzer(self.df, columns=price_action_cols, label="Price Action").analyze()
         return records(result)
 
     def _backtest_section(self):
         if not self.config.get("run_backtest"):
             return None, None
 
-        bt = Backtester(
-            self.df,
-            initial_capital=self.config["backtest_initial_capital"],
-            risk_per_trade_pct=self.config["backtest_risk_per_trade_pct"],
-            stop_loss_pct=self.config["backtest_stop_loss_pct"],
-            take_profit_pct=self.config["backtest_take_profit_pct"],
-            max_hold_bars=self.config["backtest_max_hold_bars"],
-            fee_pct=self.config["backtest_fee_pct"],
-        )
-        result = bt.run()
+        bt = self.precomputed.get("backtester")
+        result = self.precomputed.get("backtest_result")
+        if bt is None or result is None:
+            bt = Backtester(
+                self.df,
+                initial_capital=self.config["backtest_initial_capital"],
+                risk_per_trade_pct=self.config["backtest_risk_per_trade_pct"],
+                stop_loss_pct=self.config["backtest_stop_loss_pct"],
+                take_profit_pct=self.config["backtest_take_profit_pct"],
+                max_hold_bars=self.config["backtest_max_hold_bars"],
+                fee_pct=self.config["backtest_fee_pct"],
+            )
+            result = bt.run()
         comparison = bt.run_no_fee_comparison()
 
         best_signal_curve = []
@@ -182,52 +199,76 @@ class ReportExporter:
     def _combo_backtest_section(self):
         if not self.config.get("run_combo_backtest"):
             return None
-        combo_bt = ComboBacktester(
-            self.df,
-            initial_capital=self.config["backtest_initial_capital"],
-            risk_per_trade_pct=self.config["backtest_risk_per_trade_pct"],
-            stop_loss_pct=self.config["backtest_stop_loss_pct"],
-            take_profit_pct=self.config["backtest_take_profit_pct"],
-            max_hold_bars=self.config["backtest_max_hold_bars"],
-            fee_pct=self.config["backtest_fee_pct"],
-            min_combo_size=self.config.get("combo_min_size", 1),
-            max_combo_size=self.config.get("combo_max_size", 2),
-            min_fires=self.config.get("combo_min_fires", 15),
-            beam_width=self.config.get("combo_beam_width", 150),
-        )
-        result = combo_bt.run()
-        profitable = result[result["total_pnl"] > 0] if not result.empty else result
+        combo_bt = self.precomputed.get("combo_backtester")
+        profitable = self.precomputed.get("combo_profitable")
+        if combo_bt is None or profitable is None:
+            combo_bt = ComboBacktester(
+                self.df,
+                initial_capital=self.config["backtest_initial_capital"],
+                risk_per_trade_pct=self.config["backtest_risk_per_trade_pct"],
+                stop_loss_pct=self.config["backtest_stop_loss_pct"],
+                take_profit_pct=self.config["backtest_take_profit_pct"],
+                max_hold_bars=self.config["backtest_max_hold_bars"],
+                fee_pct=self.config["backtest_fee_pct"],
+                min_combo_size=self.config.get("combo_min_size", 1),
+                max_combo_size=self.config.get("combo_max_size", 2),
+                min_fires=self.config.get("combo_min_fires", 15),
+                beam_width=self.config.get("combo_beam_width", 150),
+            )
+            result = combo_bt.run()
+            profitable = result[result["total_pnl"] > 0] if not result.empty else result
+
+        # Saving every profitable combo (can be 100K+ at larger combo sizes) makes
+        # report.json unusably large for a browser to fetch/parse - the JSON/dashboard
+        # only ever need to answer "what are the best combos", so cap it here. The
+        # console's own top-N slice is separate and unaffected.
+        json_top_n = self.config.get("combo_json_top_n", 2000)
+        saved = profitable.head(json_top_n)
+
+        diverse_size = self.config.get("combo_diverse_size", 5)
+        diverse_n = self.config.get("combo_diverse_n", 10)
+        diverse = diverse_top_combos(profitable, size=diverse_size, n=diverse_n)
+
         return {
             "config": {
                 "min_combo_size": self.config.get("combo_min_size", 1),
                 "max_combo_size": self.config.get("combo_max_size", 2),
                 "min_fires": self.config.get("combo_min_fires", 15),
                 "beam_width": self.config.get("combo_beam_width", 150),
+                "profitable_combos_found": len(profitable),
+                "combos_saved_to_json": len(saved),
+                "diverse_size": diverse_size,
+                "diverse_n_requested": diverse_n,
+                "diverse_n_found": len(diverse),
                 **combo_bt.stats,
             },
-            "combinations": records(profitable),
+            "combinations": records(saved),
+            "diverse_top_combos": records(diverse),
         }
 
     def _oracle_backtest_section(self):
         if not self.config.get("run_oracle_backtest") or "oracle_signal" not in self.df.columns:
             return None
-        ob = OracleBacktester(
-            self.df,
-            initial_capital=self.config["backtest_initial_capital"],
-            risk_per_trade_pct=self.config["backtest_risk_per_trade_pct"],
-            stop_loss_pct=self.config["backtest_stop_loss_pct"],
-            take_profit_pct=self.config["backtest_take_profit_pct"],
-            max_hold_bars=self.config["backtest_max_hold_bars"],
-            fee_pct=self.config["backtest_fee_pct"],
-            portfolio_kwargs=dict(
-                max_concurrent_trades=self.config["portfolio_max_concurrent_trades"],
-                portfolio_risk_cap_pct=self.config["portfolio_risk_cap_pct"],
-                drawdown_throttle_trigger_pct=self.config["portfolio_drawdown_throttle_trigger_pct"],
-                drawdown_recovery_pct=self.config["portfolio_drawdown_recovery_pct"],
-                throttled_risk_pct=self.config["portfolio_throttled_risk_pct"],
-            ),
-        )
-        standalone, managed = ob.run()
+        standalone = self.precomputed.get("oracle_standalone")
+        managed = self.precomputed.get("oracle_managed")
+        if standalone is None or managed is None:
+            ob = OracleBacktester(
+                self.df,
+                initial_capital=self.config["backtest_initial_capital"],
+                risk_per_trade_pct=self.config["backtest_risk_per_trade_pct"],
+                stop_loss_pct=self.config["backtest_stop_loss_pct"],
+                take_profit_pct=self.config["backtest_take_profit_pct"],
+                max_hold_bars=self.config["backtest_max_hold_bars"],
+                fee_pct=self.config["backtest_fee_pct"],
+                portfolio_kwargs=dict(
+                    max_concurrent_trades=self.config["portfolio_max_concurrent_trades"],
+                    portfolio_risk_cap_pct=self.config["portfolio_risk_cap_pct"],
+                    drawdown_throttle_trigger_pct=self.config["portfolio_drawdown_throttle_trigger_pct"],
+                    drawdown_recovery_pct=self.config["portfolio_drawdown_recovery_pct"],
+                    throttled_risk_pct=self.config["portfolio_throttled_risk_pct"],
+                ),
+            )
+            standalone, managed = ob.run()
         return {
             "warning": (
                 "NOT a tradeable strategy - oracle_signal is built from the next "

@@ -50,6 +50,9 @@ COMBO_MAX_SIZE = 10  # sizes 1-2 exhaustive over the full pool; 3-10 via greedy 
 COMBO_MIN_FIRES = 15
 COMBO_CONSOLE_TOP_N = 10
 COMBO_BEAM_WIDTH = 150
+COMBO_JSON_TOP_N = 2000  # report.json/dashboard cap - a browser can't reasonably hold 100K+ rows
+COMBO_DIVERSE_SIZE = 5  # combo size used for the "10 independent strategies" section
+COMBO_DIVERSE_N = 10  # how many mutually-independent (no shared condition) combos to surface
 
 RUN_ORACLE_BACKTEST = True
 # Oracle Ceiling internally compares standalone vs a portfolio-risk-managed run
@@ -136,13 +139,20 @@ def main():
     df = build_dataset()
     print_report(df)
 
+    # Every analysis below is computed exactly ONCE here (via print_report(),
+    # which both prints the console table and returns its result) and the same
+    # result/instance is handed to ReportExporter - so the JSON export doesn't
+    # re-run the same (for ComboBacktester, very expensive) analysis a second
+    # time just to save it.
+    precomputed = {}
+
     if RUN_RELEVANCE_ANALYSIS:
         _, indicator_cols, price_action_cols, _ = column_groups(df)
-        RelevanceAnalyzer(df, columns=indicator_cols, label="Indicator").print_report()
-        RelevanceAnalyzer(df, columns=price_action_cols, label="Price Action").print_report()
+        precomputed["indicator_relevance"] = RelevanceAnalyzer(df, columns=indicator_cols, label="Indicator").print_report()
+        precomputed["price_action_relevance"] = RelevanceAnalyzer(df, columns=price_action_cols, label="Price Action").print_report()
 
     if RUN_BACKTEST:
-        Backtester(
+        bt = Backtester(
             df,
             initial_capital=BACKTEST_INITIAL_CAPITAL,
             risk_per_trade_pct=BACKTEST_RISK_PER_TRADE_PCT,
@@ -150,10 +160,12 @@ def main():
             take_profit_pct=BACKTEST_TAKE_PROFIT_PCT,
             max_hold_bars=BACKTEST_MAX_HOLD_BARS,
             fee_pct=BACKTEST_FEE_PCT,
-        ).print_report()
+        )
+        precomputed["backtester"] = bt
+        precomputed["backtest_result"] = bt.print_report()
 
     if RUN_COMBO_BACKTEST:
-        ComboBacktester(
+        combo_bt = ComboBacktester(
             df,
             initial_capital=BACKTEST_INITIAL_CAPITAL,
             risk_per_trade_pct=BACKTEST_RISK_PER_TRADE_PCT,
@@ -166,10 +178,12 @@ def main():
             min_fires=COMBO_MIN_FIRES,
             console_top_n=COMBO_CONSOLE_TOP_N,
             beam_width=COMBO_BEAM_WIDTH,
-        ).print_report()
+        )
+        precomputed["combo_backtester"] = combo_bt
+        precomputed["combo_profitable"] = combo_bt.print_report()
 
     if RUN_ORACLE_BACKTEST:
-        OracleBacktester(
+        ob = OracleBacktester(
             df,
             initial_capital=BACKTEST_INITIAL_CAPITAL,
             risk_per_trade_pct=BACKTEST_RISK_PER_TRADE_PCT,
@@ -184,10 +198,11 @@ def main():
                 drawdown_recovery_pct=PORTFOLIO_DRAWDOWN_RECOVERY_PCT,
                 throttled_risk_pct=PORTFOLIO_THROTTLED_RISK_PCT,
             ),
-        ).print_report()
+        )
+        precomputed["oracle_standalone"], precomputed["oracle_managed"] = ob.print_report()
 
     if RUN_JSON_EXPORT:
-        ReportExporter(df, export_config()).save(JSON_EXPORT_PATH)
+        ReportExporter(df, export_config(), precomputed=precomputed).save(JSON_EXPORT_PATH)
 
 
 def export_config():
@@ -212,6 +227,9 @@ def export_config():
         "combo_max_size": COMBO_MAX_SIZE,
         "combo_min_fires": COMBO_MIN_FIRES,
         "combo_beam_width": COMBO_BEAM_WIDTH,
+        "combo_json_top_n": COMBO_JSON_TOP_N,
+        "combo_diverse_size": COMBO_DIVERSE_SIZE,
+        "combo_diverse_n": COMBO_DIVERSE_N,
         "run_oracle_backtest": RUN_ORACLE_BACKTEST,
         "portfolio_max_concurrent_trades": PORTFOLIO_MAX_CONCURRENT_TRADES,
         "portfolio_risk_cap_pct": PORTFOLIO_RISK_CAP_PCT,

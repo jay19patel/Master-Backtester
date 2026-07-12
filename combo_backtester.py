@@ -37,6 +37,16 @@ reachable without exhaustively testing all ~200 billion 5-way combinations -
 it's built up one profitable step at a time instead. A cheap vectorized
 fire-count check runs first for every combination; only the ones clearing
 `min_fires` go through the much more expensive bar-by-bar trade simulation.
+
+Diversity: left unchecked, a beam search collapses onto whichever single
+condition is individually strongest (e.g. swing_low_at_pivot>median beats
+almost everything else alone), because every combo built on top of it also
+outperforms combos built on weaker foundations - so the ENTIRE beam ends up
+containing that one condition at every size beyond 2. `beam_diversity_cap`
+caps how many frontier survivors may share any single condition at each step,
+so weaker-but-different foundations stay in the running too. This is what
+makes `diverse_top_combos()` (below) able to find combos that don't all
+reduce to "condition X plus assorted extra filters".
 """
 
 import itertools
@@ -75,6 +85,7 @@ class ComboBacktester:
         console_top_n=25,
         condition_window=100,
         beam_width=150,
+        beam_diversity_cap=None,
     ):
         self.df = df
         self.min_combo_size = min_combo_size
@@ -83,6 +94,12 @@ class ComboBacktester:
         self.console_top_n = console_top_n
         self.condition_window = condition_window
         self.beam_width = beam_width
+        # Caps how many frontier survivors may share any single condition, so
+        # one dominant condition (e.g. swing_low_at_pivot>median, which beats
+        # almost everything else on its own) can't crowd out the ENTIRE beam -
+        # without this, every combo the beam ever finds beyond size 2 ends up
+        # containing that one condition, leaving nothing independent to find.
+        self.beam_diversity_cap = beam_diversity_cap or max(5, beam_width // 10)
         self.backtester = Backtester(
             df,
             initial_capital=initial_capital,
@@ -166,6 +183,24 @@ class ComboBacktester:
             "return_pct": round(total_pnl / self.backtester.initial_capital * 100, 1),
         }
 
+    def _select_diverse_frontier(self, candidates):
+        """candidates: list of (combo_names, mask, row) sorted best-PnL-first
+        already. Walks best-first, skipping any candidate where a condition it
+        uses has already hit `beam_diversity_cap` selections - so the frontier
+        can't collapse onto variations of one dominant condition, keeping
+        room for genuinely different strategies to survive into later sizes."""
+        selected = []
+        condition_counts = {}
+        for combo_names, mask, row in candidates:
+            if len(selected) >= self.beam_width:
+                break
+            if any(condition_counts.get(name, 0) >= self.beam_diversity_cap for name in combo_names):
+                continue
+            selected.append((combo_names, mask, row))
+            for name in combo_names:
+                condition_counts[name] = condition_counts.get(name, 0) + 1
+        return selected
+
     def run(self):
         """Backtest every qualifying combination. Sizes 1-2 are searched
         exhaustively; sizes 3+ (if max_combo_size allows) are built with a
@@ -204,7 +239,7 @@ class ComboBacktester:
 
                 if size == exhaustive_max_size:
                     size_survivors.sort(key=lambda item: item[2]["total_pnl"], reverse=True)
-                    frontier = size_survivors[: self.beam_width]
+                    frontier = self._select_diverse_frontier(size_survivors)
 
             # Greedy beam expansion for sizes beyond the exhaustive cutoff.
             for size in range(exhaustive_max_size + 1, self.max_combo_size + 1):
@@ -231,7 +266,7 @@ class ComboBacktester:
                         candidates.append((new_combo, combined_mask, row))
 
                 candidates.sort(key=lambda item: item[2]["total_pnl"], reverse=True)
-                frontier = candidates[: self.beam_width]
+                frontier = self._select_diverse_frontier(candidates)
 
         result = pd.DataFrame(rows)
         if not result.empty:
@@ -273,13 +308,13 @@ class ComboBacktester:
             console.print("None were profitable under these realistic assumptions.")
             return profitable
 
-        # The full profitable list (all of it, however many that is) is what
-        # gets saved to report.json / shown in the dashboard - the console only
-        # needs a readable top slice, not a multi-thousand-row dump.
+        # report.json / the dashboard get a larger (but still capped, see
+        # ReportExporter's combo_json_top_n) slice of this same ranked list -
+        # the console only needs a readable top slice, not a multi-thousand-row dump.
         shown = profitable.head(self.console_top_n)
         title = f"Top {len(shown)} of {len(profitable)} profitable combinations, best PnL first"
         if len(profitable) > len(shown):
-            title += f" (see report.json / dashboard for all {len(profitable)})"
+            title += " (see report.json / dashboard for more)"
 
         table = Table(title=title, show_lines=False)
         table.add_column("#", justify="right", style="dim")
@@ -313,3 +348,28 @@ class ComboBacktester:
             f"{best['win_rate_pct']:.1f}% win rate."
         )
         return profitable
+
+
+def diverse_top_combos(result, size=5, n=10):
+    """The plain "top N by total PnL" list is usually just one dominant
+    condition (e.g. swing_low_at_pivot>median) wearing N different extra
+    filters - not N genuinely different strategies. This picks the best `n`
+    combos of exactly `size` conditions such that NO TWO selected combos share
+    even one underlying condition - greedily walking the size-`size` combos
+    best-PnL-first and skipping any that overlap a condition already used by a
+    combo already picked. What's left is `n` mutually independent strategies,
+    each still the best available given everything picked before it."""
+    candidates = result[result["size"] == size].sort_values("total_pnl", ascending=False)
+
+    selected_rows = []
+    used_conditions = set()
+    for _, row in candidates.iterrows():
+        conditions = set(row["combo"].split(" AND "))
+        if conditions & used_conditions:
+            continue
+        selected_rows.append(row)
+        used_conditions |= conditions
+        if len(selected_rows) >= n:
+            break
+
+    return pd.DataFrame(selected_rows).reset_index(drop=True)
