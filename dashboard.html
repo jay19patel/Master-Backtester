@@ -698,18 +698,21 @@
 
     var diverse = cb.diverse_top_combos || [];
     var diverseTitleEl = document.getElementById("combo-diverse-title");
+    var diverseSize = cfg.diverse_size;
+    var sizeLabel = Array.isArray(diverseSize) ? diverseSize.join("-") : (diverseSize || 5);
     diverseTitleEl.textContent = "Top " + diverse.length + " of " + (cfg.diverse_n_requested || 10) +
-      " requested independent " + (cfg.diverse_size || 5) + "-condition strategies";
+      " requested independent " + sizeLabel + "-condition strategies";
 
     renderDataTable(document.getElementById("combo-diverse-table-container"), diverse, [
       { key: "combo", label: "Combo", text: true },
+      { key: "size", label: "size" },
       { key: "fires", label: "fires" },
       { key: "trades", label: "trades" },
       { key: "win_rate_pct", label: "win_rate%", format: function (v) { return fmt(v, 1); } },
       { key: "final_equity", label: "final_$", format: function (v) { return fmt(v, 2); } },
       { key: "total_pnl", label: "total_pnl", format: function (v) { return fmt(v, 2); }, colorize: true },
       { key: "return_pct", label: "return%", format: function (v) { return fmt(v, 1); }, colorize: true },
-    ], { defaultSort: "total_pnl", defaultDir: "desc", pageSize: 10 });
+    ], { defaultSort: "total_pnl", defaultDir: "desc", pageSize: 25 });
   }
 
   function renderOracleCeiling(report) {

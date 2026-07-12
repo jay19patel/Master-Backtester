@@ -51,8 +51,8 @@ COMBO_MIN_FIRES = 15
 COMBO_CONSOLE_TOP_N = 10
 COMBO_BEAM_WIDTH = 150
 COMBO_JSON_TOP_N = 2000  # report.json/dashboard cap - a browser can't reasonably hold 100K+ rows
-COMBO_DIVERSE_SIZE = 5  # combo size used for the "10 independent strategies" section
-COMBO_DIVERSE_N = 10  # how many mutually-independent (no shared condition) combos to surface
+COMBO_DIVERSE_SIZE = [2, 3, 4, 5]  # combo sizes considered for the "independent strategies" section
+COMBO_DIVERSE_N = 25  # how many mutually-independent (no shared condition) combos to surface
 
 RUN_ORACLE_BACKTEST = True
 # Oracle Ceiling internally compares standalone vs a portfolio-risk-managed run

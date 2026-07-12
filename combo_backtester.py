@@ -354,12 +354,17 @@ def diverse_top_combos(result, size=5, n=10):
     """The plain "top N by total PnL" list is usually just one dominant
     condition (e.g. swing_low_at_pivot>median) wearing N different extra
     filters - not N genuinely different strategies. This picks the best `n`
-    combos of exactly `size` conditions such that NO TWO selected combos share
-    even one underlying condition - greedily walking the size-`size` combos
-    best-PnL-first and skipping any that overlap a condition already used by a
-    combo already picked. What's left is `n` mutually independent strategies,
-    each still the best available given everything picked before it."""
-    candidates = result[result["size"] == size].sort_values("total_pnl", ascending=False)
+    combos - restricted to combo size(s) `size` (an int for one exact size, or
+    a list/tuple to consider several sizes together) - such that NO TWO
+    selected combos share even one underlying condition. It walks all
+    candidates best-PnL-first (across every allowed size at once) and skips
+    any that overlap a condition already used by a combo already picked. What
+    's left is `n` mutually independent strategies, each still the best
+    available given everything picked before it. Allowing multiple sizes
+    gives the greedy walk far more candidates to pick from, so it can reach a
+    larger `n` than any single size's pool of truly disjoint combos allows."""
+    sizes = [size] if isinstance(size, int) else list(size)
+    candidates = result[result["size"].isin(sizes)].sort_values("total_pnl", ascending=False)
 
     selected_rows = []
     used_conditions = set()
