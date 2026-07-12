@@ -31,10 +31,12 @@ INTERVAL = "1h"
 TOTAL_DAYS = 365
 
 # Which of the 25 candidate strategies (defined in strategies.py) to actually
-# trade. strategy_01 was the single best performer of the diverse-strategy
-# search (see strategies.py) - narrowed to just this one for close inspection
-# of its trade-by-trade behavior. Add more names back here to trade a basket.
-ACTIVE_STRATEGY_NAMES = ["strategy_01"]
+# trade. strategy_01 is the best LONG-only strategy (direction=1) and
+# strategy_02 is the best SHORT-only strategy (direction=-1) of the 25 - every
+# strategy here trades in only ONE fixed direction (see strategies.py), so
+# pairing the best of each side is how you get both LONG and SHORT signals
+# while keeping each side's most profitable strategy.
+ACTIVE_STRATEGY_NAMES = ["strategy_01", "strategy_02"]
 
 BACKTEST_INITIAL_CAPITAL = 100.0
 BACKTEST_RISK_PER_TRADE_PCT = 2.0
