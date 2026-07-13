@@ -1,0 +1,60 @@
+<div class="cards">
+  <div class="card">
+    <div class="label">Balance</div>
+    <div class="value">${{ "%.2f"|format(stats.balance) }}</div>
+    <div class="sub">of ${{ "%.0f"|format(stats.initial_capital) }} start</div>
+  </div>
+  <div class="card">
+    <div class="label">Total PnL</div>
+    <div class="value {{ 'green' if stats.total_pnl >= 0 else 'red' }}">
+      {{ "%+.2f"|format(stats.total_pnl) }}
+    </div>
+    <div class="sub {{ 'green' if stats.return_pct >= 0 else 'red' }}">{{ "%+.1f"|format(stats.return_pct) }}%</div>
+  </div>
+  <div class="card">
+    <div class="label">Win Rate</div>
+    <div class="value">{{ "%.1f"|format(stats.win_rate_pct) if stats.win_rate_pct is not none else "-" }}{{ "%" if stats.win_rate_pct is not none }}</div>
+    <div class="sub">{{ stats.closed_trades }} closed trades</div>
+  </div>
+  <div class="card">
+    <div class="label">Total Trades</div>
+    <div class="value">{{ stats.total_trades }}</div>
+    <div class="sub">{{ stats.long_trades }} LONG / {{ stats.short_trades }} SHORT</div>
+  </div>
+  <div class="card">
+    <div class="label">Open / Closed</div>
+    <div class="value">{{ stats.open_trades }} / {{ stats.closed_trades }}</div>
+    <div class="sub">open positions right now</div>
+  </div>
+  <div class="card">
+    <div class="label">Profit / Loss</div>
+    <div class="value"><span class="green">+{{ "%.2f"|format(stats.total_profit) }}</span> / <span class="red">{{ "%.2f"|format(stats.total_loss) }}</span></div>
+    <div class="sub">sum of winners / losers</div>
+  </div>
+</div>
+
+{% if stats.open_positions %}
+<h3>Open positions</h3>
+<table class="mini-table">
+  <thead>
+    <tr><th>Strategy</th><th>Direction</th><th>Entry time</th><th>Entry $</th><th>Stop $</th><th>Target $</th></tr>
+  </thead>
+  <tbody>
+    {% for p in stats.open_positions %}
+    <tr>
+      <td>{{ p.strategy }}</td>
+      <td class="{{ 'green' if p.direction == 'LONG' else 'red' }}">{{ p.direction }}</td>
+      <td>{{ p.entry_time }}</td>
+      <td>{{ "%.4f"|format(p.entry_price) }}</td>
+      <td>{{ "%.4f"|format(p.stop_price) }}</td>
+      <td>{{ "%.4f"|format(p.target_price) }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<p class="note">
+  Last cycle: {{ stats.last_run_at or "never" }} · Last candle: {{ stats.last_candle_time or "-" }} ·
+  Anchor date: {{ stats.anchor_date or "-" }}
+</p>

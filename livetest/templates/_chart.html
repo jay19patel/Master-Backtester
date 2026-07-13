@@ -1,0 +1,10 @@
+{% if chart %}
+<svg viewBox="0 0 {{ chart.width }} {{ chart.height }}" width="100%" height="{{ chart.height }}" preserveAspectRatio="none">
+  <line x1="28" x2="{{ chart.width - 28 }}" y1="{{ chart.baseline_y }}" y2="{{ chart.baseline_y }}"
+        stroke="currentColor" stroke-dasharray="4,4" stroke-width="1" opacity="0.35" />
+  <polyline points="{{ chart.points }}" fill="none" stroke="{{ chart.color }}" stroke-width="1.8" stroke-linejoin="round" />
+</svg>
+<p class="chart-meta">Range: ${{ "%.2f"|format(chart.min_val) }} - ${{ "%.2f"|format(chart.max_val) }} (dashed line = starting balance)</p>
+{% else %}
+<p class="note">Not enough trades yet to chart.</p>
+{% endif %}

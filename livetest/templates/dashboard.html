@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Live Paper Trading Dashboard</title>
+<script src="https://unpkg.com/htmx.org@1.9.10"></script>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel-2: #1e222b; --border: #2a2f3a;
+    --text: #e6e8eb; --text-dim: #9aa1ac; --accent: #4f8cff;
+    --green: #3ecf8e; --red: #f2545b;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f5f6f8; --panel: #ffffff; --panel-2: #f0f1f4; --border: #dde1e7;
+      --text: #1b1f27; --text-dim: #5b6270; --accent: #2f66d0;
+      --green: #1f9d63; --red: #d23b42;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); }
+  header { padding: 18px 24px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+  header h1 { margin: 0; font-size: 1.25rem; }
+  header button { background: var(--accent); color: #fff; border: none; padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 0.85rem; }
+  header button:hover { opacity: 0.9; }
+  main { padding: 20px 24px 60px; max-width: 1300px; margin: 0 auto; }
+  h2 { font-size: 1.05rem; margin: 26px 0 10px; }
+  h2:first-child { margin-top: 0; }
+  h3 { font-size: 0.92rem; margin: 16px 0 8px; color: var(--text-dim); }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 10px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 10px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .card .label { color: var(--text-dim); font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.03em; }
+  .card .value { font-size: 1.35rem; font-weight: 600; margin-top: 4px; }
+  .card .sub { color: var(--text-dim); font-size: 0.76rem; margin-top: 2px; }
+  .green { color: var(--green); }
+  .red { color: var(--red); }
+  p.note { color: var(--text-dim); font-size: 0.82rem; }
+  p.chart-meta { color: var(--text-dim); font-size: 0.78rem; margin-top: 6px; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  .mini-table { margin-bottom: 10px; }
+  thead th { text-align: right; padding: 7px 9px; color: var(--text-dim); border-bottom: 1px solid var(--border); white-space: nowrap; }
+  thead th:first-child { text-align: left; }
+  tbody td { padding: 6px 9px; text-align: right; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  tbody td:first-child { text-align: left; }
+  tbody tr:hover { background: var(--panel-2); }
+  .pagination { display: flex; align-items: center; gap: 10px; margin-top: 10px; font-size: 0.8rem; color: var(--text-dim); }
+  .pagination button { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); padding: 5px 12px; border-radius: 6px; cursor: pointer; }
+  .pagination button:disabled { opacity: 0.4; cursor: default; }
+  svg { display: block; color: var(--text-dim); }
+  .small-refresh {
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--text-dim);
+    padding: 3px 10px; border-radius: 6px; cursor: pointer; font-size: 0.72rem; margin-left: 8px; vertical-align: middle;
+  }
+  .htmx-indicator { opacity: 0; transition: opacity 200ms ease-in; }
+  .htmx-request .htmx-indicator, .htmx-request.htmx-indicator { opacity: 1; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Live Paper Trading — ETHUSD</h1>
+  <button hx-post="/run-now" hx-target="#stats-container" hx-swap="innerHTML" hx-indicator="#run-spinner">
+    Run cycle now <span id="run-spinner" class="htmx-indicator">…</span>
+  </button>
+</header>
+
+<main>
+  <h2>Overview <span class="note">(auto-refreshes every 15s · background fetch every {{ cycle_minutes }} min)</span></h2>
+  <div id="stats-container" hx-get="/fragments/stats" hx-trigger="every 15s" hx-swap="innerHTML">
+    {% include "_stats.html" %}
+  </div>
+
+  <h2>Equity curve</h2>
+  <div class="panel" id="chart-container" hx-get="/fragments/chart" hx-trigger="every 30s" hx-swap="innerHTML">
+    {% include "_chart.html" %}
+  </div>
+
+  <h2>Trade history
+    <button class="small-refresh" hx-get="/fragments/trades" hx-target="#trades-container" hx-swap="innerHTML">Refresh</button>
+  </h2>
+  <div id="trades-container">
+    {% include "_trades.html" %}
+  </div>
+</main>
+
+</body>
+</html>
