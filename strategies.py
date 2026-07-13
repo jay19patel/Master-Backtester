@@ -48,6 +48,7 @@ def _add_indicators(df):
     df["close_return"] = np.log(df["Close"] / df["Close"].shift(1))
     df["return_1"] = df["Close"].pct_change()  # dependency for several stats/microstructure features below
     df["return_5"] = df["Close"].pct_change(5)
+    df["return_10"] = df["Close"].pct_change(10)
     df["return_20"] = df["Close"].pct_change(20)
     df["open_close_return"] = np.log(df["Close"] / df["Open"])
     df["low_open_return"] = np.log(df["Low"] / df["Open"])
@@ -123,6 +124,7 @@ def _add_indicators(df):
     df["candle_strength"] = abs(df["Close"] - df["Open"]) / (df["High"] - df["Low"] + 0.0001)
     df["gap_up"] = (df["Open"] > df["Close"].shift(1)).astype(int)
     df["gap_down"] = (df["Open"] < df["Close"].shift(1)).astype(int)
+    df["gap_size"] = (df["Open"] - df["Close"].shift(1)) / df["Close"].shift(1)
 
     # --- statistical ---
     for period in [10, 50]:
@@ -448,16 +450,24 @@ def _add_combination_signals(df):
 # ----------------------------------------------------------------------
 STRATEGIES = [
     {
+        # Best LONG combo by raw PnL from the corrected (no-lookahead) search.
+        # The original strategy_01 (swing_low_at_pivot>median) was REMOVED: that
+        # column is built with a centered rolling window (PriceActionEngine
+        # marks it "plotting only, never for signals") - using it as a same-bar
+        # condition meant peeking `swing_right` bars into the future. Excluding
+        # it from the search pool (see main branch's combo_backtester.py) and
+        # re-running found this as the true best LONG.
         "name": "strategy_01",
-        "combo": "swing_low_at_pivot>median AND bars_since_swing_low>median",
+        "combo": "is_bullish>median AND vol_regime>median AND gap_up>median AND path_curvature>median AND wick_imbalance>median AND low_open_return>median AND open_close_return>median AND gap_size>median",
         "direction": 1,
-        # search-time stats (reference only): size=2, fires=509, trades=381, win_rate_pct=48.8, total_pnl=5142.85
+        # search-time stats (reference only): size=8, fires=134, trades=83, win_rate_pct=51.8, total_pnl=248.57
     },
     {
+        # Best SHORT combo by raw PnL from the same corrected search.
         "name": "strategy_02",
-        "combo": "price_to_vwap<median AND fractal_proxy<median AND price_entropy<median AND lower_wick<median AND wick_to_body<median",
+        "combo": "RSI_21<median AND price_entropy<median AND lower_wick<median AND wick_to_body<median AND price_to_sma_50<median AND return_10<median",
         "direction": -1,
-        # search-time stats (reference only): size=5, fires=313, trades=182, win_rate_pct=46.7, total_pnl=576.01
+        # search-time stats (reference only): size=6, fires=373, trades=184, win_rate_pct=46.2, total_pnl=630.57
     },
     {
         "name": "strategy_03",
