@@ -15,6 +15,9 @@ further, which grows capital even at the same accuracy:
   - Portfolio-level risk cap: total risk currently "on the table" across every
     open position is capped as a % of equity - on top of the per-trade risk -
     so simultaneous strategies can't compound into an outsized bet.
+  - Leverage cap: position notional is capped at `max_leverage` x current
+    equity (matches Backtester) - a real exchange won't lend more than this,
+    so risk-based sizing is capped here too if it would otherwise need more.
   - Drawdown throttle: risk-per-trade is automatically cut once the account is
     in a drawdown past a trigger, and restored once it recovers past a lower
     threshold (hysteresis, so it doesn't flip-flop every bar) - the classic
@@ -62,6 +65,7 @@ class PortfolioManager:
         drawdown_throttle_trigger_pct=10.0,
         drawdown_recovery_pct=5.0,
         throttled_risk_pct=1.0,
+        max_leverage=2.0,
         use_trailing_stop=False,
         breakeven_trigger_r=1.0,
         trail_trigger_r=1.5,
@@ -74,6 +78,9 @@ class PortfolioManager:
                                         strategy, all traded together on one account
         risk_per_trade_pct          : normal per-trade risk, % of current equity
         max_concurrent_trades       : hard cap on simultaneously open positions
+        max_leverage                 : hard cap on any position's notional as a
+                                        multiple of current equity (matches
+                                        Backtester's leverage cap)
         portfolio_risk_cap_pct      : max total risk %, summed across all open
                                        positions, allowed at any one time
         drawdown_throttle_trigger_pct: switch to `throttled_risk_pct` once the
@@ -115,6 +122,7 @@ class PortfolioManager:
         self.drawdown_throttle_trigger_pct = drawdown_throttle_trigger_pct
         self.drawdown_recovery_pct = drawdown_recovery_pct
         self.throttled_risk_pct = throttled_risk_pct
+        self.max_leverage = max_leverage
         self.use_trailing_stop = use_trailing_stop
         self.breakeven_trigger_r = breakeven_trigger_r
         # Trailing must never engage BEFORE the original target (target_r) - otherwise
@@ -171,6 +179,10 @@ class PortfolioManager:
                     stop_price = entry_price + stop_dist
                     target_price = entry_price - target_dist
 
+                position_size = risk_dollars / stop_dist
+                max_position_size = (equity * self.max_leverage) / entry_price
+                position_size = min(position_size, max_position_size)
+
                 open_positions.append(
                     {
                         "strategy": strategy_name,
@@ -181,7 +193,7 @@ class PortfolioManager:
                         "target_price": target_price,
                         "stop_dist": stop_dist,
                         "risk_dollars": risk_dollars,
-                        "position_size": risk_dollars / stop_dist,
+                        "position_size": position_size,
                         "best_price": entry_price,
                         "breakeven_done": False,
                         "trailing": False,
@@ -250,6 +262,7 @@ class PortfolioManager:
                 raw_pnl = pos["position_size"] * (exit_price - pos["entry_price"]) * direction
                 fee = pos["position_size"] * pos["entry_price"] * (self.fee_pct / 100) * 2
                 pnl = raw_pnl - fee
+                equity_before = equity
                 equity += pnl
                 just_closed_directions.add(pos["direction"])
                 trades.append(
@@ -258,7 +271,17 @@ class PortfolioManager:
                         "entry_time": df.index[pos["entry_i"]],
                         "exit_time": df.index[i],
                         "direction": "LONG" if direction == 1 else "SHORT",
+                        "entry_price": round(pos["entry_price"], 6),
+                        "exit_price": round(exit_price, 6),
+                        "stop_price": round(pos["stop_price"], 6),
+                        "target_price": round(pos["target_price"], 6),
+                        "position_size": round(pos["position_size"], 6),
+                        "leverage": round((pos["position_size"] * pos["entry_price"]) / equity_before, 3),
                         "exit_reason": exit_reason,
+                        "holding_bars": i - pos["entry_i"],
+                        "holding_time": str(df.index[i] - df.index[pos["entry_i"]]),
+                        "planned_rr": round(self.take_profit_pct / self.stop_loss_pct, 3),
+                        "rr_achieved": round((exit_price - pos["entry_price"]) * direction / pos["stop_dist"], 3),
                         "pnl": pnl,
                         "equity_after": equity,
                     }
@@ -315,13 +338,18 @@ class PortfolioManager:
             f"restored below {self.drawdown_recovery_pct:.0f}%)"
         )
         console.print(
-            f"Concurrent positions : max {self.max_concurrent_trades}, "
-            f"portfolio risk cap {self.portfolio_risk_cap_pct:.1f}% of equity"
+            f"Concurrent positions : max {self.max_concurrent_trades} (1 LONG + 1 SHORT max in practice), "
+            f"portfolio risk cap {self.portfolio_risk_cap_pct:.1f}% of equity, max leverage {self.max_leverage:.1f}x"
         )
         console.print(
-            f"Stop / Target        : {self.stop_loss_pct:.2f}% / {self.take_profit_pct:.2f}% initial bracket, "
-            f"breakeven at {self.breakeven_trigger_r:.1f}R, trail from {self.trail_trigger_r:.1f}R "
-            f"(trailing {self.trail_distance_r:.1f}R behind)"
+            f"Stop / Target        : {self.stop_loss_pct:.2f}% / {self.take_profit_pct:.2f}% initial bracket "
+            f"(1:{self.take_profit_pct / self.stop_loss_pct:.1f} reward:risk)"
+            + (
+                f", breakeven at {self.breakeven_trigger_r:.1f}R, trail from {self.trail_trigger_r:.1f}R "
+                f"(trailing {self.trail_distance_r:.1f}R behind)"
+                if self.use_trailing_stop
+                else " (fixed bracket, no trailing)"
+            )
         )
 
         n_trades = len(trades)
@@ -378,17 +406,5 @@ class PortfolioManager:
                 f"[{g_style}]{g_pnl:+.2f}[/{g_style}]",
             )
         console.print(direction_table)
-
-        per_strategy = pd.DataFrame(trades).groupby("strategy")["pnl"].agg(["count", "sum"]).rename(
-            columns={"count": "trades", "sum": "pnl"}
-        )
-        contrib_table = Table(title="Contribution per strategy", show_lines=False)
-        contrib_table.add_column("Strategy", style="bold")
-        contrib_table.add_column("trades", justify="right")
-        contrib_table.add_column("pnl", justify="right")
-        for name, row in per_strategy.sort_values("pnl", ascending=False).iterrows():
-            row_style = "green" if row["pnl"] > 0 else "red"
-            contrib_table.add_row(name, str(int(row["trades"])), f"[{row_style}]{row['pnl']:+.2f}[/{row_style}]")
-        console.print(contrib_table)
 
         return trades, final_equity, equity_curve

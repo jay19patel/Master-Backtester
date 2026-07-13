@@ -18,6 +18,11 @@ What makes this "realistic" instead of a naive lookahead-free hit-rate check:
     loses exactly that %. This is the standard way real strategies size
     positions - it also means the account can't blow up in one bad trade, and
     equity compounds realistically as it grows or shrinks.
+  - Position notional is capped at `max_leverage` x current equity (default
+    2x) - a real exchange caps how much you can borrow against your account,
+    so if the risk-based size above would need more leverage than that (e.g.
+    a very tight stop), the position is capped and the trade risks LESS than
+    `risk_per_trade_pct`, never more.
   - A round-trip fee/slippage cost (`fee_pct`) is deducted from every trade.
   - Trades for the same strategy never overlap - a new signal is ignored while
     a position from that same strategy is still open, exactly like a single
@@ -50,6 +55,7 @@ class Backtester:
         take_profit_pct=1.0,
         max_hold_bars=20,
         fee_pct=0.05,
+        max_leverage=2.0,
     ):
         """
         initial_capital    : starting account balance ($)
@@ -60,6 +66,10 @@ class Backtester:
         max_hold_bars       : force-close the trade after this many candles if
                                neither the stop nor the target was touched
         fee_pct             : round-trip fee/slippage, % of trade notional
+        max_leverage        : hard cap on position notional as a multiple of
+                               current equity (a real exchange won't lend you
+                               more than this) - risk-based sizing is capped
+                               here if it would otherwise need more
         """
         self.df = df
         self.initial_capital = initial_capital
@@ -68,6 +78,7 @@ class Backtester:
         self.take_profit_pct = take_profit_pct
         self.max_hold_bars = max_hold_bars
         self.fee_pct = fee_pct
+        self.max_leverage = max_leverage
 
     @property
     def breakeven_win_rate_pct(self):
@@ -133,12 +144,23 @@ class Backtester:
 
             risk_dollars = equity * (self.risk_per_trade_pct / 100)
             position_size = risk_dollars / stop_dist
+            max_position_size = (equity * self.max_leverage) / entry_price
+            position_size = min(position_size, max_position_size)
 
             raw_pnl = position_size * (exit_price - entry_price) * direction
             fee = position_size * entry_price * (self.fee_pct / 100) * 2  # both legs
             pnl = raw_pnl - fee
 
             equity += pnl
+            holding_bars = exit_i - entry_i
+            # R-multiple actually achieved, measured against the ORIGINAL stop
+            # distance (the risk unit "R" this trade was planned around) - a
+            # stop-out is -1.0R, a clean target hit is +take_profit/stop_loss R
+            # (e.g. +3.0R for a 1:3 bracket), a time exit lands wherever price
+            # happened to be. This is the raw price move in R, fees not netted
+            # out, since R-multiples are conventionally a price-only measure.
+            rr_achieved = (exit_price - entry_price) * direction / stop_dist
+
             trades.append(
                 {
                     "entry_time": df.index[entry_i],
@@ -149,7 +171,12 @@ class Backtester:
                     "stop_price": round(stop_price, 6),
                     "target_price": round(target_price, 6),
                     "position_size": round(position_size, 6),
+                    "leverage": round((position_size * entry_price) / (equity - pnl), 3),
                     "exit_reason": exit_reason,
+                    "holding_bars": holding_bars,
+                    "holding_time": str(df.index[exit_i] - df.index[entry_i]),
+                    "planned_rr": round(self.take_profit_pct / self.stop_loss_pct, 3),
+                    "rr_achieved": round(rr_achieved, 3),
                     "pnl": pnl,
                     "equity_after": equity,
                 }

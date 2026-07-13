@@ -40,10 +40,11 @@ ACTIVE_STRATEGY_NAMES = ["strategy_01", "strategy_02"]
 
 BACKTEST_INITIAL_CAPITAL = 100.0
 BACKTEST_RISK_PER_TRADE_PCT = 2.0
-BACKTEST_STOP_LOSS_PCT = 1
-BACKTEST_TAKE_PROFIT_PCT = 3
+BACKTEST_STOP_LOSS_PCT = 1  # 1% stop
+BACKTEST_TAKE_PROFIT_PCT = 3  # 3% target -> 1:3 reward:risk
 BACKTEST_MAX_HOLD_BARS = 20
 BACKTEST_FEE_PCT = 0.05
+BACKTEST_MAX_LEVERAGE = 2.0  # hard cap: position notional never exceeds 2x current equity
 
 # PortfolioManager risk-management knobs for the "all active strategies together" run.
 PORTFOLIO_MAX_CONCURRENT_TRADES = 5
@@ -86,6 +87,7 @@ def run_standalone(df, strategy_arrays):
         take_profit_pct=BACKTEST_TAKE_PROFIT_PCT,
         max_hold_bars=BACKTEST_MAX_HOLD_BARS,
         fee_pct=BACKTEST_FEE_PCT,
+        max_leverage=BACKTEST_MAX_LEVERAGE,
     )
 
     rows = []
@@ -115,6 +117,7 @@ def run_portfolio(df, strategy_arrays):
         take_profit_pct=BACKTEST_TAKE_PROFIT_PCT,
         max_hold_bars=BACKTEST_MAX_HOLD_BARS,
         fee_pct=BACKTEST_FEE_PCT,
+        max_leverage=BACKTEST_MAX_LEVERAGE,
         max_concurrent_trades=PORTFOLIO_MAX_CONCURRENT_TRADES,
         portfolio_risk_cap_pct=PORTFOLIO_RISK_CAP_PCT,
         drawdown_throttle_trigger_pct=PORTFOLIO_DRAWDOWN_THROTTLE_TRIGGER_PCT,
@@ -182,27 +185,36 @@ def print_trade_log(name, trade_log):
     table.add_column("Direction", style="bold")
     table.add_column("Entry time")
     table.add_column("Exit time")
+    table.add_column("Held", justify="right")
     table.add_column("Entry $", justify="right")
     table.add_column("Stop $", justify="right")
     table.add_column("Target $", justify="right")
     table.add_column("Exit $", justify="right")
+    table.add_column("Lev", justify="right")
     table.add_column("Exit reason")
+    table.add_column("Planned RR", justify="right")
+    table.add_column("Actual RR", justify="right")
     table.add_column("PnL", justify="right")
     table.add_column("Equity after", justify="right")
 
     for i, t in enumerate(trade_log, 1):
         pnl_style = "green" if t["pnl"] > 0 else "red"
         dir_style = "green" if t["direction"] == "LONG" else "red"
+        rr_style = "green" if t["rr_achieved"] > 0 else "red"
         table.add_row(
             str(i),
             f"[{dir_style}]{t['direction']}[/{dir_style}]",
             str(t["entry_time"]),
             str(t["exit_time"]),
+            f"{t['holding_bars']} bars ({t['holding_time']})",
             f"{t['entry_price']:.4f}",
             f"{t['stop_price']:.4f}",
             f"{t['target_price']:.4f}",
             f"{t['exit_price']:.4f}",
+            f"{t['leverage']:.2f}x",
             t["exit_reason"],
+            f"1:{t['planned_rr']:.1f}",
+            f"[{rr_style}]{t['rr_achieved']:+.2f}R[/{rr_style}]",
             f"[{pnl_style}]{t['pnl']:+.2f}[/{pnl_style}]",
             f"{t['equity_after']:.2f}",
         )
@@ -225,6 +237,7 @@ def save_results(standalone_df, portfolio_trades, portfolio_equity, portfolio_cu
             "drawdown_throttle_trigger_pct": PORTFOLIO_DRAWDOWN_THROTTLE_TRIGGER_PCT,
             "drawdown_recovery_pct": PORTFOLIO_DRAWDOWN_RECOVERY_PCT,
             "throttled_risk_pct": PORTFOLIO_THROTTLED_RISK_PCT,
+            "max_leverage": BACKTEST_MAX_LEVERAGE,
         },
     }
 
@@ -240,6 +253,7 @@ def save_results(standalone_df, portfolio_trades, portfolio_equity, portfolio_cu
             "take_profit_pct": BACKTEST_TAKE_PROFIT_PCT,
             "max_hold_bars": BACKTEST_MAX_HOLD_BARS,
             "fee_pct": BACKTEST_FEE_PCT,
+            "max_leverage": BACKTEST_MAX_LEVERAGE,
         },
         "standalone": standalone_df.drop(columns=["equity_curve"]).to_dict(orient="records"),
         "portfolio_managed": portfolio_section,
@@ -248,12 +262,11 @@ def save_results(standalone_df, portfolio_trades, portfolio_equity, portfolio_cu
         json.dump(payload, f, indent=2, default=str)
     standalone_df.drop(columns=["equity_curve", "trade_log"]).to_csv(RESULTS_CSV_PATH, index=False)
 
-    # Flattened per-trade order log (every active strategy's trades, one row each).
-    all_trades = []
-    for _, row in standalone_df.iterrows():
-        for t in row["trade_log"]:
-            all_trades.append({"strategy": row["name"], **t})
-    pd.DataFrame(all_trades).to_csv(TRADES_CSV_PATH, index=False)
+    # The ONE combined order book: portfolio_trades is the actual shared-account,
+    # direction-exclusive trade log (one LONG + one SHORT max at a time) - NOT
+    # the standalone per-strategy logs, which ran on separate hypothetical
+    # accounts and don't reflect the direction-exclusivity rule at all.
+    pd.DataFrame(portfolio_trades).to_csv(TRADES_CSV_PATH, index=False)
 
     print(f"[main] Saved -> {RESULTS_JSON_PATH}, {RESULTS_CSV_PATH}, {TRADES_CSV_PATH}")
 
