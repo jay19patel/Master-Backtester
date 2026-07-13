@@ -4,9 +4,14 @@ with portfolio-level risk controls a single-strategy backtest can't show at all.
 This does NOT try to raise the win rate - it manages risk and lets winners run
 further, which grows capital even at the same accuracy:
 
-  - Concurrent-position cap: limits how many trades can be open at once, so
-    several strategies firing together can't all stack risk onto the account
-    at the same time.
+  - One LONG and one SHORT open at a time, max: a new signal is skipped if a
+    position in that SAME direction is already open, no matter which strategy
+    fired it - so signals aren't just OR'd into one account, they're combined
+    into a single, direction-exclusive order book (one combined trade log,
+    chronologically ordered across every strategy).
+  - Concurrent-position cap: an extra hard ceiling on how many trades can be
+    open at once (on top of the one-per-direction rule above), in case more
+    than 2 strategies are ever traded together.
   - Portfolio-level risk cap: total risk currently "on the table" across every
     open position is capped as a % of equity - on top of the per-trade risk -
     so simultaneous strategies can't compound into an outsized bet.
@@ -146,6 +151,10 @@ class PortfolioManager:
                 if len(open_positions) >= self.max_concurrent_trades:
                     continue  # slot full - this entry is missed, not queued (realistic)
 
+                occupied_directions = {p["direction"] for p in open_positions}
+                if direction in occupied_directions:
+                    continue  # that direction already has an open position - one LONG and one SHORT max, never two of the same
+
                 current_risk_pct = self.throttled_risk_pct if throttled else self.risk_per_trade_pct
                 risk_dollars = equity * (current_risk_pct / 100)
                 open_risk_dollars = sum(p["risk_dollars"] for p in open_positions)
@@ -182,7 +191,7 @@ class PortfolioManager:
 
             # 2. Manage / close open positions using this bar's High/Low.
             still_open = []
-            just_closed_strategies = set()
+            just_closed_directions = set()
             for pos in open_positions:
                 direction = pos["direction"]
                 held = i - pos["entry_i"]
@@ -242,7 +251,7 @@ class PortfolioManager:
                 fee = pos["position_size"] * pos["entry_price"] * (self.fee_pct / 100) * 2
                 pnl = raw_pnl - fee
                 equity += pnl
-                just_closed_strategies.add(pos["strategy"])
+                just_closed_directions.add(pos["direction"])
                 trades.append(
                     {
                         "strategy": pos["strategy"],
@@ -266,16 +275,19 @@ class PortfolioManager:
                 throttled = False
 
             # 3. New signals firing on this bar get queued for next bar's open.
-            # A strategy that just closed ON THIS bar is not re-checked until the
-            # next bar either - matches Backtester, which resumes scanning at
-            # exit_i + 1, never re-testing the exit bar itself for a fresh entry.
-            active_strategies = {p["strategy"] for p in open_positions} | just_closed_strategies
+            # One LONG and one SHORT open at a time, max - never two of the same
+            # direction, regardless of which strategy fired them. A direction
+            # that just closed ON THIS bar is not re-opened until the next bar
+            # either - matches Backtester, which resumes scanning at exit_i + 1,
+            # never re-testing the exit bar itself for a fresh entry.
+            reserved_directions = {p["direction"] for p in open_positions} | just_closed_directions
             for name, arr in sig_arrays.items():
-                if name in active_strategies:
-                    continue
                 direction = arr[i]
-                if direction != 0 and i + 1 < n:
+                if direction == 0 or direction in reserved_directions:
+                    continue
+                if i + 1 < n:
                     pending_entries.append((name, direction))
+                    reserved_directions.add(direction)  # first strategy to fire this direction this bar wins
 
         return trades, equity, equity_curve
 
@@ -340,6 +352,32 @@ class PortfolioManager:
         for reason, count in exit_reasons.items():
             exit_table.add_row(reason, str(count), f"{count / n_trades * 100:.1f}%")
         console.print(exit_table)
+
+        direction_table = Table(title="LONG vs SHORT breakdown", show_lines=False)
+        direction_table.add_column("Direction", style="bold")
+        direction_table.add_column("trades", justify="right")
+        direction_table.add_column("win_rate%", justify="right")
+        direction_table.add_column("total_profit", justify="right")
+        direction_table.add_column("total_loss", justify="right")
+        direction_table.add_column("total_pnl", justify="right")
+        for label in ["LONG", "SHORT", "TOTAL"]:
+            group = trades if label == "TOTAL" else [t for t in trades if t["direction"] == label]
+            if not group:
+                continue
+            g_wins = [t for t in group if t["pnl"] > 0]
+            g_losses = [t for t in group if t["pnl"] <= 0]
+            g_pnl = sum(t["pnl"] for t in group)
+            g_style = "green" if g_pnl > 0 else "red"
+            row_style = "bold" if label == "TOTAL" else ""
+            direction_table.add_row(
+                f"[{row_style}]{label}[/{row_style}]" if row_style else label,
+                str(len(group)),
+                f"{len(g_wins) / len(group) * 100:.1f}",
+                f"{sum(t['pnl'] for t in g_wins):.2f}",
+                f"{sum(t['pnl'] for t in g_losses):.2f}",
+                f"[{g_style}]{g_pnl:+.2f}[/{g_style}]",
+            )
+        console.print(direction_table)
 
         per_strategy = pd.DataFrame(trades).groupby("strategy")["pnl"].agg(["count", "sum"]).rename(
             columns={"count": "trades", "sum": "pnl"}
