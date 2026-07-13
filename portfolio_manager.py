@@ -189,6 +189,8 @@ class PortfolioManager:
                         "direction": direction,
                         "entry_i": i,
                         "entry_price": entry_price,
+                        "equity_at_entry": equity,  # for reporting leverage - the OTHER open position can move
+                        # equity before this one closes, so equity-at-close is the wrong denominator
                         "stop_price": stop_price,
                         "target_price": target_price,
                         "stop_dist": stop_dist,
@@ -262,7 +264,6 @@ class PortfolioManager:
                 raw_pnl = pos["position_size"] * (exit_price - pos["entry_price"]) * direction
                 fee = pos["position_size"] * pos["entry_price"] * (self.fee_pct / 100) * 2
                 pnl = raw_pnl - fee
-                equity_before = equity
                 equity += pnl
                 just_closed_directions.add(pos["direction"])
                 trades.append(
@@ -276,7 +277,10 @@ class PortfolioManager:
                         "stop_price": round(pos["stop_price"], 6),
                         "target_price": round(pos["target_price"], 6),
                         "position_size": round(pos["position_size"], 6),
-                        "leverage": round((pos["position_size"] * pos["entry_price"]) / equity_before, 3),
+                        # leverage vs equity AT ENTRY, not equity-at-close - the other
+                        # open direction's P&L can move equity in between, which would
+                        # otherwise make this drift away from the actual sizing decision
+                        "leverage": round((pos["position_size"] * pos["entry_price"]) / pos["equity_at_entry"], 3),
                         "exit_reason": exit_reason,
                         "holding_bars": i - pos["entry_i"],
                         "holding_time": str(df.index[i] - df.index[pos["entry_i"]]),
