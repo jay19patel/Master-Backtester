@@ -125,7 +125,16 @@ class ComboBacktester:
         long_pool = {}
         short_pool = {}
 
-        excluded = set(OHLCV_COLUMNS) | {"oracle_signal"}
+        # swing_high_at_pivot / swing_low_at_pivot are built with a CENTERED
+        # rolling window (see PriceActionEngine.add_swings) - knowing bar i is
+        # a pivot requires seeing `swing_right` bars AFTER it, so using them
+        # directly as a same-bar condition is lookahead bias (real-time you
+        # can't know this yet). PriceActionEngine's own docstring flags them
+        # as "plotting only, never for signals" - the causal equivalents
+        # (last_swing_high/last_swing_low price levels, bars_since_swing_high/
+        # _low freshness) are NOT excluded, since those ARE properly lagged by
+        # `.shift(swing_right)` and safe to trade on.
+        excluded = set(OHLCV_COLUMNS) | {"oracle_signal", "swing_high_at_pivot", "swing_low_at_pivot"}
         indicator_cols = [
             c
             for c in df.columns
