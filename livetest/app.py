@@ -25,12 +25,26 @@ app = Flask(__name__)
 PAGE_SIZE = 15
 
 
+def _display_position(p):
+    """engine.py persists positions in the RAW format PortfolioManager needs
+    to resume a simulation (direction as 1/-1, plus internal bookkeeping
+    fields) - this maps just the fields the dashboard cares about, as strings."""
+    return {
+        "strategy": p["strategy"],
+        "direction": "LONG" if p["direction"] == 1 else "SHORT",
+        "entry_time": p["entry_time"],
+        "entry_price": p["entry_price"],
+        "stop_price": p["stop_price"],
+        "target_price": p["target_price"],
+    }
+
+
 def compute_stats():
     state = engine.load_state()
     trades = engine.load_trades()
 
     balance = state.get("balance", engine.INITIAL_CAPITAL)
-    open_positions = state.get("open_positions", [])
+    open_positions = [_display_position(p) for p in state.get("open_positions", [])]
     closed_trades = len(trades)
     open_trades = len(open_positions)
 
@@ -55,10 +69,50 @@ def compute_stats():
         "total_profit": round(sum(t["pnl"] for t in wins), 2),
         "total_loss": round(sum(t["pnl"] for t in losses), 2),
         "last_run_at": state.get("last_run_at"),
-        "last_candle_time": state.get("last_candle_time"),
-        "anchor_date": state.get("anchor_date"),
+        "last_candle_time": state.get("last_processed_time"),
         "open_positions": open_positions,
     }
+
+
+def _open_position_row(p):
+    """An open position, shaped like a trade row but with exit fields blank -
+    so the SAME table can show OPEN and CLOSED trades side by side with an
+    explicit status, instead of splitting them across two separate views."""
+    return {
+        "status": "OPEN",
+        "strategy": p["strategy"],
+        "direction": "LONG" if p["direction"] == 1 else "SHORT",
+        "entry_time": p["entry_time"],
+        "exit_time": None,
+        "entry_price": p["entry_price"],
+        "exit_price": None,
+        "stop_price": p["stop_price"],
+        "target_price": p["target_price"],
+        "leverage": round((p["position_size"] * p["entry_price"]) / p["equity_at_entry"], 3),
+        "exit_reason": None,
+        "holding_bars": None,
+        "rr_achieved": None,
+        "pnl": None,
+        "equity_after": None,
+    }
+
+
+def _closed_trade_row(t):
+    row = dict(t)
+    row["status"] = "CLOSED"
+    return row
+
+
+def build_unified_trades():
+    """Every trade, OPEN and CLOSED together in one list, most recent first -
+    status is explicit per row instead of splitting open/closed across
+    separate views."""
+    state = engine.load_state()
+    closed = [_closed_trade_row(t) for t in engine.load_trades()]
+    open_ = [_open_position_row(p) for p in state.get("open_positions", [])]
+    rows = closed + open_
+    rows.sort(key=lambda r: r["entry_time"], reverse=True)
+    return rows
 
 
 def build_equity_svg(trades, width=700, height=220):
@@ -96,11 +150,10 @@ def build_equity_svg(trades, width=700, height=220):
 @app.route("/")
 def index():
     stats = compute_stats()
-    all_trades = engine.load_trades()
-    chart = build_equity_svg(all_trades)
+    chart = build_equity_svg(engine.load_trades())  # equity curve only makes sense over CLOSED trades
 
-    recent_trades = list(reversed(all_trades))
-    total = len(recent_trades)
+    all_rows = build_unified_trades()
+    total = len(all_rows)
     total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
 
     return render_template(
@@ -108,7 +161,7 @@ def index():
         stats=stats,
         chart=chart,
         cycle_minutes=engine.CYCLE_INTERVAL_MINUTES,
-        trades=recent_trades[:PAGE_SIZE],
+        trades=all_rows[:PAGE_SIZE],
         page=1,
         total_pages=total_pages,
         total=total,
@@ -122,22 +175,19 @@ def fragment_stats():
 
 @app.route("/fragments/chart")
 def fragment_chart():
-    trades = engine.load_trades()
-    return render_template("_chart.html", chart=build_equity_svg(trades))
+    return render_template("_chart.html", chart=build_equity_svg(engine.load_trades()))
 
 
 @app.route("/fragments/trades")
 def fragment_trades():
     page = max(1, int(request.args.get("page", 1)))
-    trades = list(reversed(engine.load_trades()))  # most recent first
-    total = len(trades)
+    rows = build_unified_trades()
+    total = len(rows)
     total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     page = min(page, total_pages)
     start = (page - 1) * PAGE_SIZE
-    page_trades = trades[start : start + PAGE_SIZE]
-    return render_template(
-        "_trades.html", trades=page_trades, page=page, total_pages=total_pages, total=total
-    )
+    page_rows = rows[start : start + PAGE_SIZE]
+    return render_template("_trades.html", trades=page_rows, page=page, total_pages=total_pages, total=total)
 
 
 @app.route("/run-now", methods=["POST"])

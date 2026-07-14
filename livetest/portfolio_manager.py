@@ -32,9 +32,16 @@ further, which grows capital even at the same accuracy:
     the AVERAGE WINNER without needing a better win rate. OFF by default (see
     `use_trailing_stop`).
 
+Positions are tracked by absolute `entry_time` (not a bar-index into `self.df`)
+specifically so a simulation can be RESUMED on a different (later-fetched) df
+that doesn't contain the earlier bars at all - see `run_incremental()`, used
+by the live engine, which only ever holds a small rolling window of candles in
+memory rather than the entire history since inception.
+
 Usage:
     strategies = [{"name": "strategy_01", "direction_array": arr1}, ...]
-    PortfolioManager(df, strategies).print_report()
+    PortfolioManager(df, strategies).print_report()               # backtest, fresh start
+    PortfolioManager(df, strategies).run_incremental(prior_state)  # live, resumed
 """
 
 import numpy as np
@@ -66,6 +73,7 @@ class PortfolioManager:
         drawdown_recovery_pct=5.0,
         throttled_risk_pct=1.0,
         max_leverage=2.0,
+        bar_duration=pd.Timedelta(hours=1),
         use_trailing_stop=False,
         breakeven_trigger_r=1.0,
         trail_trigger_r=1.5,
@@ -106,10 +114,16 @@ class PortfolioManager:
                                        so it can never cap a winner short of target
         trail_distance_r             : (only if use_trailing_stop) how many R the
                                        trailing stop sits behind the best price reached
+        bar_duration                  : fixed candle spacing (default 1h), used to
+                                       convert entry_time -> held_bars. NOT inferred
+                                       from adjacent rows in self.df, since a resumed
+                                       live run's df may start mid-history with no
+                                       "previous" row to diff against.
         """
         self.df = df
         self.strategy_arrays = {s["name"]: np.asarray(s["direction_array"]) for s in strategies}
         self.strategy_names = list(self.strategy_arrays.keys())
+        self.bar_duration = bar_duration
 
         self.initial_capital = initial_capital
         self.risk_per_trade_pct = risk_per_trade_pct
@@ -135,7 +149,13 @@ class PortfolioManager:
     # ------------------------------------------------------------------
     # Core simulation - one shared account, walked bar by bar
     # ------------------------------------------------------------------
-    def run(self):
+    def _simulate(self, start_i, equity, peak_equity, throttled, open_positions, pending_entries):
+        """Shared core loop, parameterized so it can either start completely
+        fresh (run()) or resume from persisted state on a different df that
+        doesn't contain the earlier bars (run_incremental(), for live use).
+        `open_positions` entries key off entry_time (absolute), never a bar
+        index into self.df - a resumed run's df doesn't contain the bar the
+        position was originally opened on."""
         df = self.df
         n = len(df)
         open_ = df["Open"].to_numpy()
@@ -144,16 +164,10 @@ class PortfolioManager:
         close = df["Close"].to_numpy()
         sig_arrays = self.strategy_arrays
 
-        equity = self.initial_capital
-        peak_equity = equity
-        throttled = False
-
-        open_positions = []
-        pending_entries = []
         trades = []
         equity_curve = [equity]
 
-        for i in range(n):
+        for i in range(start_i, n):
             # 1. Open anything scheduled from the previous bar's signal.
             for strategy_name, direction in pending_entries:
                 if len(open_positions) >= self.max_concurrent_trades:
@@ -187,7 +201,7 @@ class PortfolioManager:
                     {
                         "strategy": strategy_name,
                         "direction": direction,
-                        "entry_i": i,
+                        "entry_time": df.index[i],
                         "entry_price": entry_price,
                         "equity_at_entry": equity,  # for reporting leverage - the OTHER open position can move
                         # equity before this one closes, so equity-at-close is the wrong denominator
@@ -208,7 +222,7 @@ class PortfolioManager:
             just_closed_directions = set()
             for pos in open_positions:
                 direction = pos["direction"]
-                held = i - pos["entry_i"]
+                held_bars = (df.index[i] - pos["entry_time"]) / self.bar_duration
                 exit_price, exit_reason = None, None
 
                 if self.use_trailing_stop:
@@ -254,7 +268,7 @@ class PortfolioManager:
                     elif hit_target:
                         exit_price, exit_reason = pos["target_price"], "target"
 
-                if exit_price is None and held >= self.max_hold_bars:
+                if exit_price is None and held_bars >= self.max_hold_bars:
                     exit_price, exit_reason = close[i], "time"
 
                 if exit_price is None:
@@ -269,7 +283,7 @@ class PortfolioManager:
                 trades.append(
                     {
                         "strategy": pos["strategy"],
-                        "entry_time": df.index[pos["entry_i"]],
+                        "entry_time": pos["entry_time"],
                         "exit_time": df.index[i],
                         "direction": "LONG" if direction == 1 else "SHORT",
                         "entry_price": round(pos["entry_price"], 6),
@@ -282,8 +296,8 @@ class PortfolioManager:
                         # otherwise make this drift away from the actual sizing decision
                         "leverage": round((pos["position_size"] * pos["entry_price"]) / pos["equity_at_entry"], 3),
                         "exit_reason": exit_reason,
-                        "holding_bars": i - pos["entry_i"],
-                        "holding_time": str(df.index[i] - df.index[pos["entry_i"]]),
+                        "holding_bars": int(held_bars),
+                        "holding_time": str(df.index[i] - pos["entry_time"]),
                         "planned_rr": round(self.take_profit_pct / self.stop_loss_pct, 3),
                         "rr_achieved": round((exit_price - pos["entry_price"]) * direction / pos["stop_dist"], 3),
                         "pnl": pnl,
@@ -320,7 +334,57 @@ class PortfolioManager:
         # pending_entries: a signal fired on the very LAST bar with nowhere to
         # enter yet (no next bar exists) - the live engine fills these once the
         # next candle's open arrives on its next fetch cycle.
+        return trades, equity, equity_curve, open_positions, pending_entries, peak_equity, throttled
+
+    def run(self):
+        """Backtest mode: fresh start at initial_capital, no prior positions."""
+        trades, equity, equity_curve, open_positions, pending_entries, _, _ = self._simulate(
+            start_i=0,
+            equity=self.initial_capital,
+            peak_equity=self.initial_capital,
+            throttled=False,
+            open_positions=[],
+            pending_entries=[],
+        )
         return trades, equity, equity_curve, open_positions, pending_entries
+
+    def run_incremental(self, prior_state):
+        """Live mode: resume from persisted state instead of starting fresh.
+        `prior_state` needs: balance, peak_equity, throttled, open_positions
+        (each with entry_time/direction/entry_price/stop_price/target_price/
+        stop_dist/risk_dollars/position_size/equity_at_entry/best_price/
+        breakeven_done/trailing), pending_entries, last_processed_time (a
+        pandas Timestamp, or None to process the entire df).
+
+        Only bars strictly AFTER last_processed_time are simulated - self.df
+        may be a small rolling window that doesn't contain the bars any
+        already-open position was originally entered on, which is exactly why
+        positions are keyed by entry_time rather than a bar index."""
+        last_processed_time = prior_state.get("last_processed_time")
+        if last_processed_time is None:
+            start_i = 0
+        else:
+            after = self.df.index > last_processed_time
+            if not after.any():
+                return (
+                    [],
+                    prior_state["balance"],
+                    [prior_state["balance"]],
+                    prior_state.get("open_positions", []),
+                    prior_state.get("pending_entries", []),
+                    prior_state.get("peak_equity", prior_state["balance"]),
+                    prior_state.get("throttled", False),
+                )
+            start_i = int(np.argmax(after))  # first True index
+
+        return self._simulate(
+            start_i=start_i,
+            equity=prior_state["balance"],
+            peak_equity=prior_state.get("peak_equity", prior_state["balance"]),
+            throttled=prior_state.get("throttled", False),
+            open_positions=prior_state.get("open_positions", []),
+            pending_entries=prior_state.get("pending_entries", []),
+        )
 
     @staticmethod
     def _max_drawdown_pct(equity_curve):

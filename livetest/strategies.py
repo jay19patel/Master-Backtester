@@ -211,20 +211,24 @@ def _add_swings(df, state, left, right):
     is_ph = df["High"] == df["High"].rolling(win, center=True, min_periods=win).max()
     is_pl = df["Low"] == df["Low"].rolling(win, center=True, min_periods=win).min()
 
-    df["swing_high_at_pivot"] = is_ph.astype(int)
-    df["swing_low_at_pivot"] = is_pl.astype(int)
-
     confirmed_high = df["High"].where(is_ph).shift(right)
     confirmed_low = df["Low"].where(is_pl).shift(right)
-    df["last_swing_high"] = confirmed_high.ffill()
-    df["last_swing_low"] = confirmed_low.ffill()
+    last_swing_high = confirmed_high.ffill()
+    last_swing_low = confirmed_low.ffill()
 
-    df["bars_since_swing_high"] = df.groupby(confirmed_high.notna().cumsum()).cumcount()
-    df["bars_since_swing_low"] = df.groupby(confirmed_low.notna().cumsum()).cumcount()
+    cross_up = (df["Close"] > last_swing_high) & (df["Close"].shift(1) <= last_swing_high.shift(1))
+    cross_dn = (df["Close"] < last_swing_low) & (df["Close"].shift(1) >= last_swing_low.shift(1))
 
-    cross_up = (df["Close"] > df["last_swing_high"]) & (df["Close"].shift(1) <= df["last_swing_high"].shift(1))
-    cross_dn = (df["Close"] < df["last_swing_low"]) & (df["Close"].shift(1) >= df["last_swing_low"].shift(1))
-    df["sig_swing_break"] = np.where(cross_up, 1, np.where(cross_dn, -1, 0))
+    new_cols = {
+        "swing_high_at_pivot": is_ph.astype(int),
+        "swing_low_at_pivot": is_pl.astype(int),
+        "last_swing_high": last_swing_high,
+        "last_swing_low": last_swing_low,
+        "bars_since_swing_high": df.groupby(confirmed_high.notna().cumsum()).cumcount(),
+        "bars_since_swing_low": df.groupby(confirmed_low.notna().cumsum()).cumcount(),
+        "sig_swing_break": np.where(cross_up, 1, np.where(cross_dn, -1, 0)),
+    }
+    df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 
     state["confirmed_high"] = confirmed_high
     state["confirmed_low"] = confirmed_low
@@ -266,10 +270,6 @@ def _add_market_structure(df, state):
             consumed_low = level_l
         trend_arr[i] = trend
 
-    df["structure_trend"] = trend_arr
-    df["sig_bos"] = bos
-    df["sig_choch"] = choch
-
     label_high = np.zeros(n)
     label_low = np.zeros(n)
     ch = state["confirmed_high"].to_numpy()
@@ -284,10 +284,16 @@ def _add_market_structure(df, state):
             if not np.isnan(prev_low):
                 label_low[i] = 1 if cl[i] > prev_low else -2
             prev_low = cl[i]
-    df["swing_high_label"] = label_high
-    df["swing_low_label"] = label_low
-    df["swing_label"] = np.where(label_low != 0, label_low, label_high)
-    return df
+
+    new_cols = {
+        "structure_trend": trend_arr,
+        "sig_bos": bos,
+        "sig_choch": choch,
+        "swing_high_label": label_high,
+        "swing_low_label": label_low,
+        "swing_label": np.where(label_low != 0, label_low, label_high),
+    }
+    return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 
 
 def _add_candlestick_signals(df):
@@ -304,16 +310,18 @@ def _add_candlestick_signals(df):
         (df["Close"] < df["Open"]) & prev_bull
         & (df["Close"] <= df["Open"].shift(1)) & (df["Open"] >= df["Close"].shift(1))
     )
-    df["sig_engulfing"] = np.where(bull_engulf, 1, np.where(bear_engulf, -1, 0))
-
     rng = df["High"] - df["Low"] + 1e-9
     upper_wick = df["High"] - df[["Open", "Close"]].max(axis=1)
     lower_wick = df[["Open", "Close"]].min(axis=1) - df["Low"]
     close_pos = (df["Close"] - df["Low"]) / rng
     bull_pin = (lower_wick >= 2 * body) & (close_pos > 0.6)
     bear_pin = (upper_wick >= 2 * body) & (close_pos < 0.4)
-    df["sig_pinbar"] = np.where(bull_pin, 1, np.where(bear_pin, -1, 0))
-    return df
+
+    new_cols = {
+        "sig_engulfing": np.where(bull_engulf, 1, np.where(bear_engulf, -1, 0)),
+        "sig_pinbar": np.where(bull_pin, 1, np.where(bear_pin, -1, 0)),
+    }
+    return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 
 
 def _add_breakout_signals(df, state):
@@ -324,12 +332,14 @@ def _add_breakout_signals(df, state):
     cl = state["confirmed_low"].copy()
     resistance = ch.dropna().rolling(3).max().reindex(df.index).ffill()
     support = cl.dropna().rolling(3).min().reindex(df.index).ffill()
-    df["resistance_level"] = resistance
-    df["support_level"] = support
-
     squeeze_on = (df["BB_upper"] < df["KC_upper"]) & (df["BB_lower"] > df["KC_lower"])
-    df["squeeze_on"] = squeeze_on.astype(int)
-    return df
+
+    new_cols = {
+        "resistance_level": resistance,
+        "support_level": support,
+        "squeeze_on": squeeze_on.astype(int),
+    }
+    return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 
 
 def _add_smart_money_signals(df, state, max_zone_age, max_active_zones):
@@ -382,14 +392,16 @@ def _add_smart_money_signals(df, state, max_zone_age, max_active_zones):
                 bear_zones.remove(zone)
                 fired = True
 
-    df["sig_ob_retest"] = ob_sig
-
     lsl = df["last_swing_low"]
     lsh = df["last_swing_high"]
     bull_sweep = (df["Low"] < lsl) & (df["Close"] > lsl) & (df["Close"] > df["Open"])
     bear_sweep = (df["High"] > lsh) & (df["Close"] < lsh) & (df["Close"] < df["Open"])
-    df["sig_sweep"] = np.where(bull_sweep, 1, np.where(bear_sweep, -1, 0))
-    return df
+
+    new_cols = {
+        "sig_ob_retest": ob_sig,
+        "sig_sweep": np.where(bull_sweep, 1, np.where(bear_sweep, -1, 0)),
+    }
+    return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 
 
 def _add_fibonacci_signals(df):
@@ -408,11 +420,11 @@ def _add_fibonacci_signals(df):
     in_zone_up = (df["Low"] <= up_top) & (df["Low"] >= up_bot)
     in_zone_dn = (df["High"] >= dn_bot) & (df["High"] <= dn_top)
 
-    df["sig_fib_retracement"] = np.where(
+    sig_fib_retracement = np.where(
         (df["structure_trend"] == 1) & in_zone_up & bull_candle, 1,
         np.where((df["structure_trend"] == -1) & in_zone_dn & bear_candle, -1, 0),
     )
-    return df
+    return pd.concat([df, pd.DataFrame({"sig_fib_retracement": sig_fib_retracement}, index=df.index)], axis=1)
 
 
 def _add_range_signals(df):
@@ -421,8 +433,8 @@ def _add_range_signals(df):
     inside = (df["High"] < df["High"].shift(1)) & (df["Low"] > df["Low"].shift(1))
     break_up = inside.shift(1, fill_value=False) & (df["Close"] > df["High"].shift(1))
     break_dn = inside.shift(1, fill_value=False) & (df["Close"] < df["Low"].shift(1))
-    df["sig_inside_bar_breakout"] = np.where(break_up, 1, np.where(break_dn, -1, 0))
-    return df
+    sig_inside_bar_breakout = np.where(break_up, 1, np.where(break_dn, -1, 0))
+    return pd.concat([df, pd.DataFrame({"sig_inside_bar_breakout": sig_inside_bar_breakout}, index=df.index)], axis=1)
 
 
 def _add_combination_signals(df):
@@ -437,11 +449,14 @@ def _add_combination_signals(df):
         + np.sign(df["DMP_14"] - df["DMN_14"]) * (df["ADX_14"] > 20)
         + np.sign(df["Close"] - df["VWAP"])
     )
-    df["trend_score"] = votes
     fresh_up = (votes >= 4) & (votes.shift(1) < 4)
     fresh_dn = (votes <= -4) & (votes.shift(1) > -4)
-    df["sig_trend_confluence"] = np.where(fresh_up, 1, np.where(fresh_dn, -1, 0))
-    return df
+
+    new_cols = {
+        "trend_score": votes,
+        "sig_trend_confluence": np.where(fresh_up, 1, np.where(fresh_dn, -1, 0)),
+    }
+    return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 
 
 # ----------------------------------------------------------------------

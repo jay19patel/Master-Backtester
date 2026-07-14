@@ -33,28 +33,7 @@
   </div>
 </div>
 
-{% if stats.open_positions %}
-<h3>Open positions</h3>
-<table class="mini-table">
-  <thead>
-    <tr><th>Strategy</th><th>Direction</th><th>Entry time</th><th>Entry $</th><th>Stop $</th><th>Target $</th></tr>
-  </thead>
-  <tbody>
-    {% for p in stats.open_positions %}
-    <tr>
-      <td>{{ p.strategy }}</td>
-      <td class="{{ 'green' if p.direction == 'LONG' else 'red' }}">{{ p.direction }}</td>
-      <td>{{ p.entry_time }}</td>
-      <td>{{ "%.4f"|format(p.entry_price) }}</td>
-      <td>{{ "%.4f"|format(p.stop_price) }}</td>
-      <td>{{ "%.4f"|format(p.target_price) }}</td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
-{% endif %}
-
 <p class="note">
-  Last cycle: {{ stats.last_run_at or "never" }} · Last candle: {{ stats.last_candle_time or "-" }} ·
-  Anchor date: {{ stats.anchor_date or "-" }}
+  Last cycle: {{ stats.last_run_at or "never" }} · Last candle processed: {{ stats.last_candle_time or "-" }} ·
+  Open positions are shown with status OPEN in the Trade History table below.
 </p>

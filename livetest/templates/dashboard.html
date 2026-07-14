@@ -45,6 +45,11 @@
   tbody td { padding: 6px 9px; text-align: right; border-bottom: 1px solid var(--border); white-space: nowrap; }
   tbody td:first-child { text-align: left; }
   tbody tr:hover { background: var(--panel-2); }
+  .status-open, .status-closed {
+    font-weight: 600; font-size: 0.72rem; padding: 2px 8px; border-radius: 10px; text-align: center;
+  }
+  .status-open { background: rgba(79, 140, 255, 0.15); color: var(--accent); }
+  .status-closed { background: var(--panel-2); color: var(--text-dim); }
   .pagination { display: flex; align-items: center; gap: 10px; margin-top: 10px; font-size: 0.8rem; color: var(--text-dim); }
   .pagination button { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); padding: 5px 12px; border-radius: 6px; cursor: pointer; }
   .pagination button:disabled { opacity: 0.4; cursor: default; }

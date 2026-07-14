@@ -24,7 +24,6 @@ class DataFetcher:
         self.interval = interval
         self.total_days = total_days
         self.cache_dir = cache_dir
-        os.makedirs(self.cache_dir, exist_ok=True)
 
     @property
     def cache_path(self):
@@ -32,7 +31,7 @@ class DataFetcher:
         return os.path.join(self.cache_dir, filename)
 
     def fetch(self, force_refresh=False):
-        """Return the OHLCV DataFrame, using the local cache unless force_refresh is set."""
+        """Return the OHLCV DataFrame, using the local CSV cache unless force_refresh is set."""
         if not force_refresh and os.path.exists(self.cache_path):
             print(f"[DataFetcher] Loading cached data: {self.cache_path}")
             return pd.read_csv(self.cache_path, index_col=0, parse_dates=True)
@@ -44,8 +43,18 @@ class DataFetcher:
             print("[DataFetcher] Warning: no data returned from API.")
             return df
 
+        os.makedirs(self.cache_dir, exist_ok=True)
         df.to_csv(self.cache_path)
         print(f"[DataFetcher] Saved {len(df)} rows to {self.cache_path}")
+        return df
+
+    def fetch_nocache(self):
+        """Hit the API directly, no CSV read or write - for live polling, where
+        candles are only ever held in memory, never persisted to disk."""
+        print(f"[DataFetcher] Fetching {self.symbol} ({self.interval}), last {self.total_days} days (no cache)...")
+        df = self._fetch_from_api()
+        if df.empty:
+            print("[DataFetcher] Warning: no data returned from API.")
         return df
 
     def _fetch_from_api(self):

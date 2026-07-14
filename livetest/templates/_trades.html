@@ -1,34 +1,37 @@
 <table>
   <thead>
     <tr>
-      <th>Strategy</th><th>Dir</th><th>Entry time</th><th>Exit time</th><th>Held</th>
-      <th>Entry $</th><th>Exit $</th><th>Lev</th><th>Exit reason</th><th>RR</th><th>PnL</th><th>Equity after</th>
+      <th>Status</th><th>Strategy</th><th>Dir</th><th>Entry time</th><th>Exit time</th><th>Held</th>
+      <th>Entry $</th><th>Exit $</th><th>Stop $</th><th>Target $</th><th>Lev</th><th>Exit reason</th><th>RR</th><th>PnL</th><th>Equity after</th>
     </tr>
   </thead>
   <tbody>
     {% for t in trades %}
     <tr>
+      <td class="{{ 'status-open' if t.status == 'OPEN' else 'status-closed' }}">{{ t.status }}</td>
       <td>{{ t.strategy }}</td>
       <td class="{{ 'green' if t.direction == 'LONG' else 'red' }}">{{ t.direction }}</td>
       <td>{{ t.entry_time }}</td>
-      <td>{{ t.exit_time }}</td>
-      <td>{{ t.holding_bars }} bars</td>
+      <td>{{ t.exit_time or "—" }}</td>
+      <td>{{ (t.holding_bars ~ " bars") if t.holding_bars is not none else "—" }}</td>
       <td>{{ "%.4f"|format(t.entry_price) }}</td>
-      <td>{{ "%.4f"|format(t.exit_price) }}</td>
+      <td>{{ "%.4f"|format(t.exit_price) if t.exit_price is not none else "—" }}</td>
+      <td>{{ "%.4f"|format(t.stop_price) }}</td>
+      <td>{{ "%.4f"|format(t.target_price) }}</td>
       <td>{{ "%.2f"|format(t.leverage) }}x</td>
-      <td>{{ t.exit_reason }}</td>
-      <td class="{{ 'green' if t.rr_achieved > 0 else 'red' }}">{{ "%+.2f"|format(t.rr_achieved) }}R</td>
-      <td class="{{ 'green' if t.pnl > 0 else 'red' }}">{{ "%+.2f"|format(t.pnl) }}</td>
-      <td>{{ "%.2f"|format(t.equity_after) }}</td>
+      <td>{{ t.exit_reason or "—" }}</td>
+      <td class="{{ 'green' if t.rr_achieved and t.rr_achieved > 0 else ('red' if t.rr_achieved else '') }}">{{ "%+.2f"|format(t.rr_achieved) ~ "R" if t.rr_achieved is not none else "—" }}</td>
+      <td class="{{ 'green' if t.pnl and t.pnl > 0 else ('red' if t.pnl else '') }}">{{ "%+.2f"|format(t.pnl) if t.pnl is not none else "—" }}</td>
+      <td>{{ "%.2f"|format(t.equity_after) if t.equity_after is not none else "—" }}</td>
     </tr>
     {% else %}
-    <tr><td colspan="12" class="note">No trades yet.</td></tr>
+    <tr><td colspan="15" class="note">No trades yet.</td></tr>
     {% endfor %}
   </tbody>
 </table>
 
 <div class="pagination">
   <button hx-get="/fragments/trades?page={{ page - 1 }}" hx-target="#trades-container" hx-swap="innerHTML" {{ "disabled" if page <= 1 }}>&laquo; Prev</button>
-  <span>Page {{ page }} of {{ total_pages }} ({{ total }} trades)</span>
+  <span>Page {{ page }} of {{ total_pages }} ({{ total }} rows, OPEN + CLOSED)</span>
   <button hx-get="/fragments/trades?page={{ page + 1 }}" hx-target="#trades-container" hx-swap="innerHTML" {{ "disabled" if page >= total_pages }}>Next &raquo;</button>
 </div>
