@@ -19,7 +19,7 @@ pd.set_option("display.max_columns", None)
 pd.set_option("display.width", 200)
 
 SYMBOL = "ETHUSD"
-INTERVAL = "1h"
+INTERVAL = "15m"
 TOTAL_DAYS = 50
 
 INCLUDE_INDICATORS = True
