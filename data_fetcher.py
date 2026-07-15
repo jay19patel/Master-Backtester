@@ -16,7 +16,7 @@ class DataFetcher:
     """
 
     API_URL = "https://api.india.delta.exchange/v2/history/candles"
-    CHUNK_FREQ = "7D"
+    CHUNK_FREQ = "30D"
     TIMEZONE = "Asia/Kolkata"
 
     def __init__(self, symbol="ADAUSD", interval="15m", total_days=100, cache_dir="data"):

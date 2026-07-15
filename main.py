@@ -1,11 +1,6 @@
-"""Entry point: fetch data, engineer indicators, add oracle labels, and report stats.
-
-Pipeline order (also the console report order):
-    1. Indicator relevance   - which technical indicators connect to the oracle signal
-    2. Price Action relevance - same methodology/schema, applied to sig_* signals instead
-    3. Backtest               - each sig_* signal traded alone, real PnL
-    4. Combo Backtest         - combinations of indicators + sig_* signals, real PnL
-    5. Oracle Ceiling         - the oracle's own label backtested (a theoretical benchmark)
+"""Entry point: fetch data, engineer indicators + price-action signals, then
+exhaustively combo-backtest every indicator condition crossed with every
+price-action signal and report the top combinations by real PnL.
 """
 
 from datetime import datetime, timezone
@@ -14,14 +9,10 @@ import pandas as pd
 from rich.console import Console
 from rich.table import Table
 
-from backtester import Backtester
 from combo_backtester import ComboBacktester
 from data_fetcher import DataFetcher
 from indicator_engine import IndicatorEngine
-from oracle_backtester import OracleBacktester
-from oracle_labeler import OracleLabeler
 from price_action_engine import PriceActionEngine
-from relevance_analyzer import RelevanceAnalyzer
 from report_exporter import ReportExporter
 
 pd.set_option("display.max_columns", None)
@@ -29,39 +20,33 @@ pd.set_option("display.width", 200)
 
 SYMBOL = "ETHUSD"
 INTERVAL = "1h"
-TOTAL_DAYS = 365
-ORACLE_LOOKAHEAD = 20
-ORACLE_MIN_REWARD_RISK_RATIO = 2.0  # 1:2 minimum - the winning side must be at least double the losing side
+TOTAL_DAYS = 50
 
 INCLUDE_INDICATORS = True
-RUN_RELEVANCE_ANALYSIS = True
+# Largest rolling window IndicatorEngine uses is 100 bars (EMA_100/SMA_100) -
+# pandas_ta returns None instead of a column when there isn't enough history,
+# which crashes with a confusing AttributeError deep inside IndicatorEngine.
+# This catches it early with an actionable message instead.
+MIN_INDICATOR_BARS = 150
 
-RUN_BACKTEST = True
-BACKTEST_INITIAL_CAPITAL = 100.0
+BACKTEST_INITIAL_CAPITAL = 1000.0
 BACKTEST_RISK_PER_TRADE_PCT = 2.0
 BACKTEST_STOP_LOSS_PCT = 1  # 1% stop-loss
-BACKTEST_TAKE_PROFIT_PCT = 3  # 2% target -> 1:2 reward:risk, matches ORACLE_MIN_REWARD_RISK_RATIO
+BACKTEST_TAKE_PROFIT_PCT = 3  # 3% target -> 1:3 reward:risk
 BACKTEST_MAX_HOLD_BARS = 20
 BACKTEST_FEE_PCT = 0.05
 
 RUN_COMBO_BACKTEST = True
-COMBO_MIN_SIZE = 1
-COMBO_MAX_SIZE = 10  # sizes 1-2 exhaustive over the full pool; 3-10 via greedy beam search (see ComboBacktester)
+COMBO_MIN_SIZE = 3
+# Safety ceiling, not a target - the Apriori search (see ComboBacktester) tries
+# every size exhaustively (1, 1+2, 1+2+3, ...) and stops on its own the moment
+# no combo of a size can clear COMBO_MIN_FIRES anymore. This just bounds how
+# far it's allowed to go if conditions turn out to be highly correlated.
+COMBO_MAX_SIZE = 50
 COMBO_MIN_FIRES = 15
-COMBO_CONSOLE_TOP_N = 10
-COMBO_BEAM_WIDTH = 150
-COMBO_JSON_TOP_N = 2000  # report.json/dashboard cap - a browser can't reasonably hold 100K+ rows
-COMBO_DIVERSE_SIZE = [2, 3, 4, 5]  # combo sizes considered for the "independent strategies" section
-COMBO_DIVERSE_N = 25  # how many mutually-independent (no shared condition) combos to surface
-
-RUN_ORACLE_BACKTEST = True
-# Oracle Ceiling internally compares standalone vs a portfolio-risk-managed run
-# of the oracle's own label - these are that risk-management setup's parameters.
-PORTFOLIO_MAX_CONCURRENT_TRADES = 3
-PORTFOLIO_RISK_CAP_PCT = 6.0
-PORTFOLIO_DRAWDOWN_THROTTLE_TRIGGER_PCT = 10.0
-PORTFOLIO_DRAWDOWN_RECOVERY_PCT = 5.0
-PORTFOLIO_THROTTLED_RISK_PCT = 1.0
+COMBO_CONSOLE_TOP_N = 20
+COMBO_JSON_TOP_N = 2000  # report.json/dashboard cap - a browser can't reasonably hold huge row counts
+COMBO_N_WORKERS = None  # None = cpu_count - 1
 
 RUN_JSON_EXPORT = True
 JSON_EXPORT_PATH = "report.json"
@@ -77,25 +62,24 @@ def build_dataset():
         raise RuntimeError("No data fetched - aborting.")
 
     if INCLUDE_INDICATORS:
+        if len(df) < MIN_INDICATOR_BARS:
+            raise RuntimeError(
+                f"Only {len(df)} candles fetched (TOTAL_DAYS={TOTAL_DAYS}, INTERVAL={INTERVAL!r}), but "
+                f"IndicatorEngine needs at least {MIN_INDICATOR_BARS} bars of history (its largest rolling "
+                f"window is 100 bars, e.g. EMA_100/SMA_100) - increase TOTAL_DAYS and re-run."
+            )
         df = IndicatorEngine(df).build()
 
     df = PriceActionEngine(df).build()
-
-    df = OracleLabeler(
-        df, lookahead=ORACLE_LOOKAHEAD, min_reward_risk_ratio=ORACLE_MIN_REWARD_RISK_RATIO
-    ).label()
     return df
 
 
 def column_groups(df):
-    """Split columns into OHLCV / indicator / price-action / oracle buckets for reporting."""
-    oracle_cols = [c for c in df.columns if c.startswith("oracle_")]
+    """Split columns into OHLCV / indicator / price-action buckets for reporting."""
     ohlcv_cols = [c for c in OHLCV_COLUMNS if c in df.columns]
     price_action_cols = [c for c in df.columns if c.startswith("sig_")]
-    indicator_cols = [
-        c for c in df.columns if c not in oracle_cols and c not in ohlcv_cols and c not in price_action_cols
-    ]
-    return ohlcv_cols, indicator_cols, price_action_cols, oracle_cols
+    indicator_cols = [c for c in df.columns if c not in ohlcv_cols and c not in price_action_cols]
+    return ohlcv_cols, indicator_cols, price_action_cols
 
 
 def print_report(df):
@@ -108,26 +92,12 @@ def print_report(df):
     console.print(f"[dim]Date range[/dim]             {df.index.min()}  ->  {df.index.max()}")
     console.print(f"[dim]Missing values (total)[/dim] {int(df.isna().sum().sum())}")
 
-    if "oracle_signal" in df.columns:
-        console.print(f"\n[bold]Oracle signal[/bold] (min reward:risk = 1:{ORACLE_MIN_REWARD_RISK_RATIO:.0f})")
-        counts = df["oracle_signal"].value_counts(dropna=False).sort_index()
-        signal_table = Table(show_lines=False)
-        signal_table.add_column("Signal", style="bold")
-        signal_table.add_column("Count", justify="right")
-        signal_table.add_column("Percent", justify="right")
-        for value, count in counts.items():
-            name = value if pd.notna(value) else "UNKNOWN (tail, no future data yet)"
-            pct = count / len(df) * 100
-            signal_table.add_row(name, str(int(count)), f"{pct:.1f}%")
-        console.print(signal_table)
-
-    ohlcv_cols, indicator_cols, price_action_cols, oracle_cols = column_groups(df)
+    ohlcv_cols, indicator_cols, price_action_cols = column_groups(df)
     column_groups_table = Table(title="Columns", show_lines=False)
     column_groups_table.add_column("Bucket", style="bold")
     column_groups_table.add_column("Count", justify="right")
     for label, cols in [
         ("OHLCV", ohlcv_cols),
-        ("Oracle", oracle_cols),
         ("Indicator", indicator_cols),
         ("Price Action", price_action_cols),
     ]:
@@ -139,30 +109,9 @@ def main():
     df = build_dataset()
     print_report(df)
 
-    # Every analysis below is computed exactly ONCE here (via print_report(),
-    # which both prints the console table and returns its result) and the same
-    # result/instance is handed to ReportExporter - so the JSON export doesn't
-    # re-run the same (for ComboBacktester, very expensive) analysis a second
-    # time just to save it.
+    # Computed once here and handed to ReportExporter so the JSON export
+    # doesn't re-run the (expensive) combo search a second time just to save it.
     precomputed = {}
-
-    if RUN_RELEVANCE_ANALYSIS:
-        _, indicator_cols, price_action_cols, _ = column_groups(df)
-        precomputed["indicator_relevance"] = RelevanceAnalyzer(df, columns=indicator_cols, label="Indicator").print_report()
-        precomputed["price_action_relevance"] = RelevanceAnalyzer(df, columns=price_action_cols, label="Price Action").print_report()
-
-    if RUN_BACKTEST:
-        bt = Backtester(
-            df,
-            initial_capital=BACKTEST_INITIAL_CAPITAL,
-            risk_per_trade_pct=BACKTEST_RISK_PER_TRADE_PCT,
-            stop_loss_pct=BACKTEST_STOP_LOSS_PCT,
-            take_profit_pct=BACKTEST_TAKE_PROFIT_PCT,
-            max_hold_bars=BACKTEST_MAX_HOLD_BARS,
-            fee_pct=BACKTEST_FEE_PCT,
-        )
-        precomputed["backtester"] = bt
-        precomputed["backtest_result"] = bt.print_report()
 
     if RUN_COMBO_BACKTEST:
         combo_bt = ComboBacktester(
@@ -177,29 +126,10 @@ def main():
             max_combo_size=COMBO_MAX_SIZE,
             min_fires=COMBO_MIN_FIRES,
             console_top_n=COMBO_CONSOLE_TOP_N,
-            beam_width=COMBO_BEAM_WIDTH,
+            n_workers=COMBO_N_WORKERS,
         )
         precomputed["combo_backtester"] = combo_bt
         precomputed["combo_profitable"] = combo_bt.print_report()
-
-    if RUN_ORACLE_BACKTEST:
-        ob = OracleBacktester(
-            df,
-            initial_capital=BACKTEST_INITIAL_CAPITAL,
-            risk_per_trade_pct=BACKTEST_RISK_PER_TRADE_PCT,
-            stop_loss_pct=BACKTEST_STOP_LOSS_PCT,
-            take_profit_pct=BACKTEST_TAKE_PROFIT_PCT,
-            max_hold_bars=BACKTEST_MAX_HOLD_BARS,
-            fee_pct=BACKTEST_FEE_PCT,
-            portfolio_kwargs=dict(
-                max_concurrent_trades=PORTFOLIO_MAX_CONCURRENT_TRADES,
-                portfolio_risk_cap_pct=PORTFOLIO_RISK_CAP_PCT,
-                drawdown_throttle_trigger_pct=PORTFOLIO_DRAWDOWN_THROTTLE_TRIGGER_PCT,
-                drawdown_recovery_pct=PORTFOLIO_DRAWDOWN_RECOVERY_PCT,
-                throttled_risk_pct=PORTFOLIO_THROTTLED_RISK_PCT,
-            ),
-        )
-        precomputed["oracle_standalone"], precomputed["oracle_managed"] = ob.print_report()
 
     if RUN_JSON_EXPORT:
         ReportExporter(df, export_config(), precomputed=precomputed).save(JSON_EXPORT_PATH)
@@ -212,10 +142,6 @@ def export_config():
         "symbol": SYMBOL,
         "interval": INTERVAL,
         "total_days": TOTAL_DAYS,
-        "oracle_lookahead": ORACLE_LOOKAHEAD,
-        "oracle_min_reward_risk_ratio": ORACLE_MIN_REWARD_RISK_RATIO,
-        "run_relevance_analysis": RUN_RELEVANCE_ANALYSIS,
-        "run_backtest": RUN_BACKTEST,
         "backtest_initial_capital": BACKTEST_INITIAL_CAPITAL,
         "backtest_risk_per_trade_pct": BACKTEST_RISK_PER_TRADE_PCT,
         "backtest_stop_loss_pct": BACKTEST_STOP_LOSS_PCT,
@@ -226,16 +152,7 @@ def export_config():
         "combo_min_size": COMBO_MIN_SIZE,
         "combo_max_size": COMBO_MAX_SIZE,
         "combo_min_fires": COMBO_MIN_FIRES,
-        "combo_beam_width": COMBO_BEAM_WIDTH,
         "combo_json_top_n": COMBO_JSON_TOP_N,
-        "combo_diverse_size": COMBO_DIVERSE_SIZE,
-        "combo_diverse_n": COMBO_DIVERSE_N,
-        "run_oracle_backtest": RUN_ORACLE_BACKTEST,
-        "portfolio_max_concurrent_trades": PORTFOLIO_MAX_CONCURRENT_TRADES,
-        "portfolio_risk_cap_pct": PORTFOLIO_RISK_CAP_PCT,
-        "portfolio_drawdown_throttle_trigger_pct": PORTFOLIO_DRAWDOWN_THROTTLE_TRIGGER_PCT,
-        "portfolio_drawdown_recovery_pct": PORTFOLIO_DRAWDOWN_RECOVERY_PCT,
-        "portfolio_throttled_risk_pct": PORTFOLIO_THROTTLED_RISK_PCT,
     }
 
 

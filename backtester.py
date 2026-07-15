@@ -36,6 +36,89 @@ from rich.table import Table
 from price_action_engine import PriceActionEngine
 
 
+def simulate_trades(
+    sig, open_, high, low, close,
+    initial_capital, risk_per_trade_pct, stop_loss_pct, take_profit_pct, max_hold_bars, fee_pct,
+    index=None,
+):
+    """Core bar-by-bar bracket simulation (entry at next open, stop/target walked
+    bar by bar, risk-based sizing, fees, no overlapping trades). Shared by
+    Backtester (single signals, full trade detail incl. timestamps) and
+    ComboBacktester's parallel workers (index=None skips entry_time/exit_time,
+    which combo scoring never reads - keeps the per-task payload numpy-only, no
+    DataFrame needed in the worker process)."""
+    n = len(open_)
+    equity = initial_capital
+    trades = []
+
+    i = 0
+    while i < n - 1:
+        direction = sig[i]
+        if direction == 0:
+            i += 1
+            continue
+
+        entry_i = i + 1  # act on the NEXT candle's open - no lookahead
+        if entry_i >= n:
+            break
+        entry_price = open_[entry_i]
+
+        stop_dist = entry_price * (stop_loss_pct / 100)
+        target_dist = entry_price * (take_profit_pct / 100)
+        if direction == 1:
+            stop_price = entry_price - stop_dist
+            target_price = entry_price + target_dist
+        else:
+            stop_price = entry_price + stop_dist
+            target_price = entry_price - target_dist
+
+        exit_price, exit_reason, exit_i = None, "time", min(entry_i + max_hold_bars, n - 1)
+
+        for j in range(entry_i, exit_i + 1):
+            if direction == 1:
+                hit_stop = low[j] <= stop_price
+                hit_target = high[j] >= target_price
+            else:
+                hit_stop = high[j] >= stop_price
+                hit_target = low[j] <= target_price
+
+            # If a single candle's range could have hit both, assume the
+            # worse outcome (stop) happened first - the conservative,
+            # realistic default when you don't know the exact intra-candle path.
+            if hit_stop:
+                exit_price, exit_reason, exit_i = stop_price, "stop", j
+                break
+            if hit_target:
+                exit_price, exit_reason, exit_i = target_price, "target", j
+                break
+
+        if exit_price is None:
+            exit_price, exit_reason = close[exit_i], "time"
+
+        risk_dollars = equity * (risk_per_trade_pct / 100)
+        position_size = risk_dollars / stop_dist
+
+        raw_pnl = position_size * (exit_price - entry_price) * direction
+        fee = position_size * entry_price * (fee_pct / 100) * 2  # both legs
+        pnl = raw_pnl - fee
+
+        equity += pnl
+        trade = {
+            "direction": "LONG" if direction == 1 else "SHORT",
+            "exit_reason": exit_reason,
+            "pnl": pnl,
+            "equity_after": equity,
+        }
+        if index is not None:
+            trade["entry_time"] = index[entry_i]
+            trade["exit_time"] = index[exit_i]
+        trades.append(trade)
+
+        i = exit_i + 1  # no overlapping trades for the same signal
+
+    return trades, equity
+
+
 class Backtester:
     """Backtests every sig_* column independently against a fixed starting balance.
 
@@ -101,81 +184,20 @@ class Backtester:
         reuse this exact, already-validated simulation without needing to
         write it to a real column on the DataFrame first."""
         df = self.df
-        n = len(df)
-        open_ = df["Open"].to_numpy()
-        high = df["High"].to_numpy()
-        low = df["Low"].to_numpy()
-        close = df["Close"].to_numpy()
-
-        equity = self.initial_capital
-        trades = []
-
-        i = 0
-        while i < n - 1:
-            direction = sig[i]
-            if direction == 0:
-                i += 1
-                continue
-
-            entry_i = i + 1  # act on the NEXT candle's open - no lookahead
-            if entry_i >= n:
-                break
-            entry_price = open_[entry_i]
-
-            stop_dist = entry_price * (self.stop_loss_pct / 100)
-            target_dist = entry_price * (self.take_profit_pct / 100)
-            if direction == 1:
-                stop_price = entry_price - stop_dist
-                target_price = entry_price + target_dist
-            else:
-                stop_price = entry_price + stop_dist
-                target_price = entry_price - target_dist
-
-            exit_price, exit_reason, exit_i = None, "time", min(entry_i + self.max_hold_bars, n - 1)
-
-            for j in range(entry_i, exit_i + 1):
-                if direction == 1:
-                    hit_stop = low[j] <= stop_price
-                    hit_target = high[j] >= target_price
-                else:
-                    hit_stop = high[j] >= stop_price
-                    hit_target = low[j] <= target_price
-
-                # If a single candle's range could have hit both, assume the
-                # worse outcome (stop) happened first - the conservative,
-                # realistic default when you don't know the exact intra-candle path.
-                if hit_stop:
-                    exit_price, exit_reason, exit_i = stop_price, "stop", j
-                    break
-                if hit_target:
-                    exit_price, exit_reason, exit_i = target_price, "target", j
-                    break
-
-            if exit_price is None:
-                exit_price, exit_reason = close[exit_i], "time"
-
-            risk_dollars = equity * (self.risk_per_trade_pct / 100)
-            position_size = risk_dollars / stop_dist
-
-            raw_pnl = position_size * (exit_price - entry_price) * direction
-            fee = position_size * entry_price * (self.fee_pct / 100) * 2  # both legs
-            pnl = raw_pnl - fee
-
-            equity += pnl
-            trades.append(
-                {
-                    "entry_time": df.index[entry_i],
-                    "exit_time": df.index[exit_i],
-                    "direction": "LONG" if direction == 1 else "SHORT",
-                    "exit_reason": exit_reason,
-                    "pnl": pnl,
-                    "equity_after": equity,
-                }
-            )
-
-            i = exit_i + 1  # no overlapping trades for the same signal
-
-        return trades, equity
+        return simulate_trades(
+            sig,
+            df["Open"].to_numpy(),
+            df["High"].to_numpy(),
+            df["Low"].to_numpy(),
+            df["Close"].to_numpy(),
+            self.initial_capital,
+            self.risk_per_trade_pct,
+            self.stop_loss_pct,
+            self.take_profit_pct,
+            self.max_hold_bars,
+            self.fee_pct,
+            index=df.index,
+        )
 
     @staticmethod
     def _max_drawdown_pct(trades):

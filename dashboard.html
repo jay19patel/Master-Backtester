@@ -200,64 +200,18 @@
       <h2>Columns</h2>
       <div class="panel">
         <p class="note" id="column-summary"></p>
-        <div class="col-list" id="column-list"></div>
       </div>
-    </section>
-
-    <section class="tab" data-tab="oracle">
-      <h2>Oracle signal distribution</h2>
-      <div class="panel" id="oracle-bars"></div>
-      <h2>What each signal means</h2>
-      <div class="cards" id="oracle-meaning-cards"></div>
-    </section>
-
-    <section class="tab" data-tab="relevance">
-      <h2>Indicator relevance vs oracle BUY/SELL signal</h2>
-      <p class="note">fires: how many candles this was evaluated on. hit_rate%: of the bars it actually moved on a BUY/SELL candle, % it moved the same way the signal called (50% = coin flip). buy_match% / sell_match%: that hit-rate split by BUY vs SELL candles. corr_value / corr_change: Pearson correlation of raw value / bar-to-bar change vs the oracle's net edge.</p>
-      <div id="relevance-table-container"></div>
-    </section>
-
-    <section class="tab" data-tab="priceaction">
-      <h2>Price Action relevance vs oracle BUY/SELL signal</h2>
-      <p class="note">Same methodology and columns as the Indicator tab, applied to the sig_* price-action signals instead of technical indicators - so the two are directly comparable.</p>
-      <div id="priceaction-table-container"></div>
-    </section>
-
-    <section class="tab" data-tab="backtest">
-      <h2>Backtest - every signal on its own starting balance</h2>
-      <div class="cards" id="backtest-config-cards"></div>
-      <h2>Top signals by total PnL</h2>
-      <div class="panel chart-panel" id="backtest-bar-chart"></div>
-      <h2 id="backtest-best-title">Best signal - equity curve</h2>
-      <div class="panel chart-panel" id="backtest-equity-chart"></div>
-      <h2>All signals</h2>
-      <div id="backtest-table-container"></div>
-      <h2>Fee-drag comparison</h2>
-      <p class="note">Same signals re-run with fees stripped out, to isolate raw directional edge from fee/leverage drag.</p>
-      <div id="feecomparison-table-container"></div>
     </section>
 
     <section class="tab" data-tab="combos">
       <h2>Combo backtest</h2>
-      <p class="note">Searches combinations that freely mix EVERY indicator column (each compared to its own trailing rolling median) together with every price-action signal - ALL must agree on direction on the same candle - and backtests each one for real PnL the same realistic way as a single signal (entry at next open, stop/target bracket, risk-based sizing, fees). Most combinations naturally get zero/few fires since requiring several conditions to align exactly is rare; only profitable combinations are shown below, ranked by total PnL so the biggest profit/capital-growth combination is always row 1.</p>
+      <p class="note">Every indicator condition (compared to its own trailing rolling median) exhaustively crossed with every other indicator condition and price-action signal - ALL must agree on direction on the same candle - and backtested for real PnL the same realistic way as a single signal (entry at next open, stop/target bracket, risk-based sizing, fees). Most combinations naturally get zero/few fires since requiring several conditions to align exactly is rare; only profitable combinations are shown below, ranked by total PnL so the biggest profit/capital-growth combination is always row 1.</p>
       <div class="cards" id="combo-config-cards"></div>
       <div class="callout" id="combo-best-callout"></div>
       <h2>Top profitable combinations by total PnL</h2>
       <div class="panel chart-panel" id="combo-bar-chart"></div>
       <h2 id="combo-table-title">Top profitable combinations</h2>
       <div id="combo-table-container"></div>
-
-      <h2 id="combo-diverse-title">Top 10 independent strategies</h2>
-      <p class="note">The list above is usually one dominant condition wearing several different extra filters - not 10 genuinely different ideas. This picks the best 5-condition combos such that NO TWO share even a single underlying condition, so each row below is a distinct, independent strategy rather than a variation on the same theme.</p>
-      <div id="combo-diverse-table-container"></div>
-    </section>
-
-    <section class="tab" data-tab="oracleceiling">
-      <div class="warning-banner" id="oracle-ceiling-warning"></div>
-      <h2>Standalone vs portfolio-managed</h2>
-      <div class="cards" id="oracle-ceiling-cards"></div>
-      <h2>Equity curve (portfolio-managed)</h2>
-      <div class="panel chart-panel" id="oracle-ceiling-chart"></div>
     </section>
   </main>
 </div>
@@ -510,12 +464,7 @@
   // ------------------------------------------------------------------
   var TABS = [
     { key: "overview", label: "Overview" },
-    { key: "oracle", label: "Oracle" },
-    { key: "relevance", label: "Relevance" },
-    { key: "priceaction", label: "Price Action" },
-    { key: "backtest", label: "Backtest" },
     { key: "combos", label: "Combo Backtest" },
-    { key: "oracleceiling", label: "Oracle Ceiling" },
   ];
 
   function setupNav() {
@@ -560,12 +509,10 @@
 
     var cfg = report.config;
     var configPairs = [
-      ["Oracle lookahead", cfg.oracle_lookahead + " candles"],
-      ["Oracle min R:R", "1:" + cfg.oracle_min_reward_risk_ratio],
       ["Backtest stop/target", cfg.backtest_stop_loss_pct + "% / " + cfg.backtest_take_profit_pct + "%"],
       ["Backtest risk/trade", cfg.backtest_risk_per_trade_pct + "%"],
-      ["Portfolio risk cap", cfg.portfolio_risk_cap_pct + "%"],
-      ["Drawdown throttle", "at " + cfg.portfolio_drawdown_throttle_trigger_pct + "%"],
+      ["Combo sizes", cfg.combo_min_size + " - " + cfg.combo_max_size],
+      ["Combo min fires", cfg.combo_min_fires],
     ];
     var ccContainer = document.getElementById("config-cards");
     configPairs.forEach(function (pair) {
@@ -578,59 +525,8 @@
     var groups = d.column_groups;
     var priceActionCols = groups.price_action || [];
     document.getElementById("column-summary").textContent =
-      groups.ohlcv.length + " OHLCV, " + groups.oracle.length + " oracle, " + groups.indicator.length +
+      groups.ohlcv.length + " OHLCV, " + groups.indicator.length +
       " indicator, " + priceActionCols.length + " price-action columns.";
-    var listContainer = document.getElementById("column-list");
-    groups.oracle.forEach(function (name) {
-      listContainer.appendChild(el("span", { class: "chip" }, [name]));
-    });
-  }
-
-  function renderOracle(report) {
-    var oracle = report.oracle;
-    if (!oracle) return;
-
-    var barsContainer = document.getElementById("oracle-bars");
-    var total = Object.keys(oracle.signal_counts).reduce(function (sum, k) { return sum + oracle.signal_counts[k]; }, 0);
-    var colors = { BUY: "var(--green)", SELL: "var(--red)", HOLD: "var(--yellow)", UNKNOWN: "var(--text-dim)" };
-    renderBarChart(
-      barsContainer,
-      Object.keys(oracle.signal_counts).map(function (name) { return { label: name, value: oracle.signal_counts[name] }; }),
-      {
-        valueFormat: function (v) { return v.toLocaleString() + " (" + (total ? (v / total * 100).toFixed(1) : 0) + "%)"; },
-        colorFn: function (v, label) { return colors[label] || "var(--accent)"; },
-      }
-    );
-
-    var meaningContainer = document.getElementById("oracle-meaning-cards");
-    Object.keys(oracle.signal_meaning || {}).forEach(function (signal) {
-      var m = oracle.signal_meaning[signal];
-      meaningContainer.appendChild(el("div", { class: "card" }, [
-        el("div", { class: "label" }, [signal + " (" + m.candles + " candles)"]),
-        el("div", { class: "value" }, ["+" + fmt(m.avg_upside_pct, 2) + "% / " + fmt(m.avg_downside_pct, 2) + "%"]),
-      ]));
-    });
-
-  }
-
-  // Shared by both the Indicator and Price Action tabs - same methodology, same
-  // columns, just a different column set analyzed (technical indicators vs sig_*
-  // price-action signals), so the two reports are directly comparable.
-  function renderRelevanceTable(container, rows) {
-    renderDataTable(container, rows, [
-      { key: "indicator", label: "Name", text: true },
-      { key: "fires", label: "fires" },
-      { key: "hit_rate_pct", label: "hit_rate%", format: function (v) { return fmt(v, 1); } },
-      { key: "buy_match_pct", label: "buy_match%", format: function (v) { return fmt(v, 1); } },
-      { key: "sell_match_pct", label: "sell_match%", format: function (v) { return fmt(v, 1); } },
-      { key: "move_rate_pct", label: "move_%", format: function (v) { return fmt(v, 1); } },
-      { key: "corr_value", label: "corr_val", format: function (v) { return fmt(v, 3); } },
-      { key: "corr_change", label: "corr_chg", format: function (v) { return fmt(v, 3); } },
-    ], { defaultSort: "relevance_score", defaultDir: "desc" });
-  }
-
-  function renderRelevance(report) {
-    renderRelevanceTable(document.getElementById("relevance-table-container"), report.indicator_relevance || []);
   }
 
   function renderCombo(report) {
@@ -695,132 +591,6 @@
       { key: "total_pnl", label: "total_pnl", format: function (v) { return fmt(v, 2); }, colorize: true },
       { key: "return_pct", label: "return%", format: function (v) { return fmt(v, 1); }, colorize: true },
     ], { defaultSort: "total_pnl", defaultDir: "desc" });
-
-    var diverse = cb.diverse_top_combos || [];
-    var diverseTitleEl = document.getElementById("combo-diverse-title");
-    var diverseSize = cfg.diverse_size;
-    var sizeLabel = Array.isArray(diverseSize) ? diverseSize.join("-") : (diverseSize || 5);
-    diverseTitleEl.textContent = "Top " + diverse.length + " of " + (cfg.diverse_n_requested || 10) +
-      " requested independent " + sizeLabel + "-condition strategies";
-
-    renderDataTable(document.getElementById("combo-diverse-table-container"), diverse, [
-      { key: "combo", label: "Combo", text: true },
-      { key: "size", label: "size" },
-      { key: "fires", label: "fires" },
-      { key: "trades", label: "trades" },
-      { key: "win_rate_pct", label: "win_rate%", format: function (v) { return fmt(v, 1); } },
-      { key: "final_equity", label: "final_$", format: function (v) { return fmt(v, 2); } },
-      { key: "total_pnl", label: "total_pnl", format: function (v) { return fmt(v, 2); }, colorize: true },
-      { key: "return_pct", label: "return%", format: function (v) { return fmt(v, 1); }, colorize: true },
-    ], { defaultSort: "total_pnl", defaultDir: "desc", pageSize: 25 });
-  }
-
-  function renderOracleCeiling(report) {
-    var ob = report.oracle_backtest;
-    var warningContainer = document.getElementById("oracle-ceiling-warning");
-    var cardsContainer = document.getElementById("oracle-ceiling-cards");
-    var chartContainer = document.getElementById("oracle-ceiling-chart");
-    if (!ob) {
-      cardsContainer.appendChild(el("p", { class: "note" }, ["Oracle ceiling backtest was not run."]));
-      return;
-    }
-
-    warningContainer.appendChild(el("div", {}, [el("strong", {}, ["Not tradeable: "]), ob.warning]));
-
-    var standalone = ob.standalone;
-    var managed = ob.managed;
-
-    function pnlValue(v) {
-      return el("div", { class: "value " + (v >= 0 ? "green" : "red") }, [(v >= 0 ? "+" : "") + fmt(v, 2)]);
-    }
-
-    var cardDefs = [
-      ["Trades", standalone.trades + " vs " + managed.trades],
-      ["Win rate%", fmt(standalone.win_rate_pct, 1) + "% vs " + fmt(managed.win_rate_pct, 1) + "%"],
-      ["Final $ - standalone", "$" + fmt(standalone.final_equity, 2)],
-      ["Final $ - managed", "$" + fmt(managed.final_equity, 2)],
-      ["Max drawdown% - managed", fmt(managed.max_drawdown_pct, 1) + "%"],
-    ];
-    cardDefs.forEach(function (pair) {
-      cardsContainer.appendChild(el("div", { class: "card" }, [
-        el("div", { class: "label" }, [pair[0]]),
-        el("div", { class: "value" }, [String(pair[1])]),
-      ]));
-    });
-    cardsContainer.appendChild(el("div", { class: "card" }, [
-      el("div", { class: "label" }, ["Total PnL - standalone"]),
-      pnlValue(standalone.total_pnl),
-    ]));
-    cardsContainer.appendChild(el("div", { class: "card" }, [
-      el("div", { class: "label" }, ["Total PnL - managed"]),
-      pnlValue(managed.total_pnl),
-    ]));
-
-    if (managed.equity_curve && managed.equity_curve.length > 1) {
-      var initialCapital = (report.config && report.config.backtest_initial_capital) || 100;
-      renderLineChart(chartContainer, managed.equity_curve, {
-        label: "equity $", baseline: initialCapital,
-      });
-    } else {
-      chartContainer.appendChild(el("p", { class: "note" }, ["Not enough data to chart."]));
-    }
-  }
-
-  function renderPriceAction(report) {
-    renderRelevanceTable(document.getElementById("priceaction-table-container"), report.price_action_relevance || []);
-  }
-
-  function renderBacktest(report) {
-    var bt = report.backtest;
-    if (!bt) return;
-
-    var cfgContainer = document.getElementById("backtest-config-cards");
-    var pairs = [
-      ["Initial capital", "$" + bt.config.initial_capital],
-      ["Risk per trade", bt.config.risk_per_trade_pct + "%"],
-      ["Stop / Target", bt.config.stop_loss_pct + "% / " + bt.config.take_profit_pct + "%"],
-      ["Fee (round trip)", (bt.config.fee_pct * 2).toFixed(2) + "%"],
-      ["Breakeven win rate", fmt(bt.breakeven_win_rate_pct, 1) + "% before fees"],
-      ["Fee-adjusted breakeven", fmt(bt.fee_adjusted_breakeven_win_rate_pct, 1) + "% after fees"],
-    ];
-    pairs.forEach(function (pair) {
-      cfgContainer.appendChild(el("div", { class: "card" }, [
-        el("div", { class: "label" }, [pair[0]]),
-        el("div", { class: "value" }, [String(pair[1])]),
-      ]));
-    });
-
-    var topSignals = (bt.results || []).slice(0, 10).map(function (r) { return { label: r.signal, value: r.total_pnl }; });
-    renderBarChart(document.getElementById("backtest-bar-chart"), topSignals, {
-      valueFormat: function (v) { return (v >= 0 ? "+" : "") + fmt(v, 2); },
-    });
-
-    if (bt.best_signal_name && bt.best_signal_equity_curve && bt.best_signal_equity_curve.length > 1) {
-      document.getElementById("backtest-best-title").textContent = bt.best_signal_name + " - equity curve (per trade)";
-      renderLineChart(document.getElementById("backtest-equity-chart"), bt.best_signal_equity_curve, {
-        label: "equity $", baseline: bt.config.initial_capital,
-      });
-    }
-
-    renderDataTable(document.getElementById("backtest-table-container"), bt.results || [], [
-      { key: "signal", label: "Signal", text: true },
-      { key: "trades", label: "trades" },
-      { key: "win_rate_pct", label: "win_rate%", format: function (v) { return fmt(v, 1); } },
-      { key: "final_equity", label: "final_$", format: function (v) { return fmt(v, 2); } },
-      { key: "total_pnl", label: "total_pnl", format: function (v) { return fmt(v, 2); }, colorize: true },
-      { key: "total_profit", label: "total_profit", format: function (v) { return fmt(v, 2); } },
-      { key: "total_loss", label: "total_loss", format: function (v) { return fmt(v, 2); } },
-      { key: "return_pct", label: "return%", format: function (v) { return fmt(v, 1); }, colorize: true },
-      { key: "max_drawdown_pct", label: "max_dd%", format: function (v) { return fmt(v, 1); } },
-    ], { defaultSort: "total_pnl", defaultDir: "desc" });
-
-    renderDataTable(document.getElementById("feecomparison-table-container"), bt.fee_comparison || [], [
-      { key: "signal", label: "Signal", text: true },
-      { key: "win_rate_pct", label: "win_rate%", format: function (v) { return fmt(v, 1); } },
-      { key: "total_pnl", label: "pnl_with_fees", format: function (v) { return fmt(v, 2); }, colorize: true },
-      { key: "total_pnl_no_fees", label: "pnl_no_fees", format: function (v) { return fmt(v, 2); }, colorize: true },
-      { key: "fee_drag_$", label: "fee_drag_$", format: function (v) { return fmt(v, 2); } },
-    ], { defaultSort: "total_pnl_no_fees", defaultDir: "desc", pageSize: 24 });
   }
 
   // ------------------------------------------------------------------
@@ -830,12 +600,7 @@
     REPORT = report;
     setupNav();
     renderOverview(report);
-    renderOracle(report);
-    renderRelevance(report);
-    renderPriceAction(report);
-    renderBacktest(report);
     renderCombo(report);
-    renderOracleCeiling(report);
     document.getElementById("app").style.display = "block";
   }
 
