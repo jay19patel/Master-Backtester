@@ -44,11 +44,34 @@ def _json_safe(value):
     return value
 
 
-def records(df):
-    """DataFrame -> list of JSON-safe dicts. None/empty-safe."""
+def compact_combo_records(df):
+    """ALL combos (no top-N cap), compacted: every condition/signal name used
+    anywhere is deduped into one `condition_dictionary` array, and each combo
+    stores small integer indices into it instead of repeating the full
+    " AND "-joined string - the joined string can be 500+ characters for a
+    large combo, and with every combo now exported (not just a top-2000 slice)
+    that string would dominate file size. The dashboard reconstructs the
+    display string client-side from the dictionary + indices."""
     if df is None or len(df) == 0:
-        return []
-    return [{k: _json_safe(v) for k, v in row.items()} for row in df.to_dict(orient="records")]
+        return [], []
+
+    dictionary = sorted({name for conditions in df["conditions"] for name in conditions})
+    index_of = {name: i for i, name in enumerate(dictionary)}
+
+    rows = []
+    for row in df.to_dict(orient="records"):
+        rows.append({
+            "direction": row["direction"],
+            "size": _json_safe(row["size"]),
+            "fires": _json_safe(row["fires"]),
+            "trades": _json_safe(row["trades"]),
+            "win_rate_pct": _json_safe(row["win_rate_pct"]),
+            "final_equity": _json_safe(row["final_equity"]),
+            "total_pnl": _json_safe(row["total_pnl"]),
+            "return_pct": _json_safe(row["return_pct"]),
+            "conditions": [index_of[name] for name in row["conditions"]],
+        })
+    return dictionary, rows
 
 
 class ReportExporter:
@@ -105,12 +128,10 @@ class ReportExporter:
             result = combo_bt.run()
             profitable = result[result["total_pnl"] > 0] if not result.empty else result
 
-        # Saving every profitable combo (can be a lot at larger combo sizes) makes
-        # report.json unusably large for a browser to fetch/parse - the JSON/dashboard
-        # only ever need to answer "what are the best combos", so cap it here. The
-        # console's own top-N slice is separate and unaffected.
-        json_top_n = self.config.get("combo_json_top_n", 2000)
-        saved = profitable.head(json_top_n)
+        # ALL profitable combos go in, no top-N cap - compact_combo_records()
+        # keeps the file size sane by deduping condition names into one shared
+        # dictionary instead of repeating full joined strings per row.
+        condition_dictionary, combinations = compact_combo_records(profitable)
 
         return {
             "config": {
@@ -118,10 +139,11 @@ class ReportExporter:
                 "max_combo_size": self.config.get("combo_max_size", 8),
                 "min_fires": self.config.get("combo_min_fires", 15),
                 "profitable_combos_found": len(profitable),
-                "combos_saved_to_json": len(saved),
+                "combos_saved_to_json": len(combinations),
                 **combo_bt.stats,
             },
-            "combinations": records(saved),
+            "condition_dictionary": condition_dictionary,
+            "combinations": combinations,
         }
 
     def build(self):

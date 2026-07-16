@@ -20,7 +20,7 @@ pd.set_option("display.width", 200)
 
 SYMBOL = "ETHUSD"
 INTERVAL = "15m"
-TOTAL_DAYS = 50
+TOTAL_DAYS = 600
 
 INCLUDE_INDICATORS = True
 # Largest rolling window IndicatorEngine uses is 100 bars (EMA_100/SMA_100) -
@@ -42,11 +42,17 @@ COMBO_MIN_SIZE = 3
 # every size exhaustively (1, 1+2, 1+2+3, ...) and stops on its own the moment
 # no combo of a size can clear COMBO_MIN_FIRES anymore. This just bounds how
 # far it's allowed to go if conditions turn out to be highly correlated.
-COMBO_MAX_SIZE = 50
+COMBO_MAX_SIZE = 100
 COMBO_MIN_FIRES = 15
 COMBO_CONSOLE_TOP_N = 20
-COMBO_JSON_TOP_N = 2000  # report.json/dashboard cap - a browser can't reasonably hold huge row counts
-COMBO_N_WORKERS = None  # None = cpu_count - 1
+COMBO_N_WORKERS = None  # None = every CPU core (max throughput over responsiveness)
+# Two hard ceilings that make the search stop CLEANLY (never sample/truncate)
+# once a level can't fully complete - see ComboBacktester's module docstring.
+# Raise these if you have RAM/time to spare and want the search to reach
+# further before stopping; report.json/console always say exactly where and
+# why it stopped.
+COMBO_MAX_RAW_CANDIDATES_PER_LEVEL = 20_000_000
+COMBO_MAX_SURVIVORS_PER_LEVEL = 2_000_000
 
 RUN_JSON_EXPORT = True
 JSON_EXPORT_PATH = "report.json"
@@ -127,6 +133,8 @@ def main():
             min_fires=COMBO_MIN_FIRES,
             console_top_n=COMBO_CONSOLE_TOP_N,
             n_workers=COMBO_N_WORKERS,
+            max_raw_candidates_per_level=COMBO_MAX_RAW_CANDIDATES_PER_LEVEL,
+            max_survivors_per_level=COMBO_MAX_SURVIVORS_PER_LEVEL,
         )
         precomputed["combo_backtester"] = combo_bt
         precomputed["combo_profitable"] = combo_bt.print_report()
@@ -152,7 +160,6 @@ def export_config():
         "combo_min_size": COMBO_MIN_SIZE,
         "combo_max_size": COMBO_MAX_SIZE,
         "combo_min_fires": COMBO_MIN_FIRES,
-        "combo_json_top_n": COMBO_JSON_TOP_N,
     }
 
 

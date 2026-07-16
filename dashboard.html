@@ -529,6 +529,19 @@
       " indicator, " + priceActionCols.length + " price-action columns.";
   }
 
+  // report.json ships combos compacted: each combo's "conditions" is a list of
+  // small integer indices into report.combo_backtest.condition_dictionary,
+  // not the full joined string (which can be 500+ characters for a large
+  // combo, and every profitable combo is now exported, not just a top-N
+  // slice) - reconstruct the display string here instead.
+  function directionLabel(d) {
+    return d === 1 || d === "Long" ? "Long" : (d === -1 || d === "Short" ? "Short" : String(d));
+  }
+
+  function comboLabel(dictionary, row) {
+    return (row.conditions || []).map(function (i) { return dictionary[i]; }).join(" AND ");
+  }
+
   function renderCombo(report) {
     var cb = report.combo_backtest;
     var cfgContainer = document.getElementById("combo-config-cards");
@@ -538,6 +551,7 @@
     }
 
     var cfg = cb.config;
+    var dictionary = cb.condition_dictionary || [];
     var pairs = [
       ["Combo sizes", cfg.min_combo_size + " - " + cfg.max_combo_size],
       ["Min fires", cfg.min_fires],
@@ -554,7 +568,9 @@
       ]));
     });
 
-    var combos = cb.combinations || [];
+    var combos = (cb.combinations || []).map(function (r) {
+      return Object.assign({}, r, { comboText: comboLabel(dictionary, r), directionText: directionLabel(r.direction) });
+    });
 
     var calloutContainer = document.getElementById("combo-best-callout");
     var initialCapital = (report.config && report.config.backtest_initial_capital) || 100;
@@ -562,7 +578,7 @@
       var best = combos[0];
       calloutContainer.appendChild(el("div", {}, [
         el("strong", {}, ["Best combination (max profit / capital growth): "]),
-        best.combo + " — $" + fmt(initialCapital, 0) + " grew to $" + fmt(best.final_equity, 2) +
+        "[" + best.directionText + "] " + best.comboText + " — $" + fmt(initialCapital, 0) + " grew to $" + fmt(best.final_equity, 2) +
           " (" + (best.return_pct >= 0 ? "+" : "") + fmt(best.return_pct, 1) + "%) over " + best.trades +
           " trades, " + fmt(best.win_rate_pct, 1) + "% win rate.",
       ]));
@@ -572,17 +588,16 @@
 
     var titleEl = document.getElementById("combo-table-title");
     var found = cfg.profitable_combos_found || combos.length;
-    titleEl.textContent = combos.length < found
-      ? "Top " + combos.length.toLocaleString() + " of " + found.toLocaleString() + " profitable combinations"
-      : "All " + combos.length.toLocaleString() + " profitable combinations";
+    titleEl.textContent = "All " + combos.length.toLocaleString() + " of " + found.toLocaleString() + " profitable combinations";
 
-    var topCombos = combos.slice(0, 10).map(function (r) { return { label: r.combo, value: r.total_pnl }; });
+    var topCombos = combos.slice(0, 10).map(function (r) { return { label: "[" + r.directionText + "] " + r.comboText, value: r.total_pnl }; });
     renderBarChart(document.getElementById("combo-bar-chart"), topCombos, {
       valueFormat: function (v) { return (v >= 0 ? "+" : "") + fmt(v, 2); },
     });
 
     renderDataTable(document.getElementById("combo-table-container"), combos, [
-      { key: "combo", label: "Combo", text: true },
+      { key: "directionText", label: "Dir" },
+      { key: "comboText", label: "Combo", text: true },
       { key: "size", label: "size" },
       { key: "fires", label: "fires" },
       { key: "trades", label: "trades" },
