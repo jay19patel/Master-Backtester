@@ -25,36 +25,45 @@ else can only keep the same fire count or shrink it, so no combination built
 on top of it could ever clear the threshold either - dropping it loses no
 result, only search space.
 
-Exhaustive, not approximate, NEVER randomly sampled - Apriori-style level-wise
-search: with a pool of 100+ conditions, generating every raw combination the
-plain way (C(pool, k) for every k) explodes fast past k=3-4. Instead, size-k
-combinations are only built by EXTENDING size-(k-1) combinations that already
-cleared `min_fires`. This loses zero results: ANDing in one more condition can
-only keep the fire count the same or shrink it (never grow it), so any k-combo
-that clears min_fires necessarily has every one of its (k-1)-subsets also
-clearing min_fires - meaning each of those subsets is guaranteed to already be
-sitting in the previous level, ready to be extended. Nothing reachable is
-skipped.
+Exhaustive where possible, quality-guided (never random) where not -
+Apriori-style level-wise search: size-k combinations are only built by
+EXTENDING size-(k-1) combinations that already cleared `min_fires` (ANDing in
+one more condition can only shrink the fire count, never grow it, so this
+misses nothing a plain C(pool, k) enumeration would find - it's just far
+cheaper to compute). With a pool of 100+ conditions this still explodes past
+size 4-5, though: every size-1 condition is simulated immediately (not
+deferred) to get each one's own real standalone total_pnl - this becomes a
+per-condition quality score. When a level's survivor count would exceed
+`max_survivors_per_level`, instead of a random reservoir OR simply stopping,
+the survivors are ranked by the SUM of their member conditions' quality scores
+and only the top `max_survivors_per_level` continue - so the combos that keep
+getting explored at deeper sizes are the ones built from conditions with
+already-proven, individually-real edge, not an arbitrary or random slice. This
+is reported plainly (`trimmed_levels`) with exactly how many were trimmed at
+each size, so it's never mistaken for a complete/exhaustive count.
 
-No sampling, ever - either a level completes 100% or the search stops clean:
-if a level's candidate count would exceed `max_raw_candidates_per_level`
-(before filtering) or its survivor count would exceed
-`max_survivors_per_level` (after filtering), the search STOPS at the last
-fully-completed size for that direction - it does NOT keep a random/partial
-slice and pretend to continue. Every size that IS reported is a complete,
-exhaustive count; sizes beyond the stop point are simply not explored. This is
-reported plainly (`stopped_levels`) so you know exactly how far the search
-went and why.
-
-Performance - full CPU parallelism, not just for simulation: both the
-fire-count prefilter (cheap boolean AND per candidate) AND the bar-by-bar
-trade simulation (expensive) are distributed across a process pool
-(`n_workers`, default = every CPU core). Each worker is initialized once with
-the OHLC arrays and condition pools (not a full DataFrame, and masks are never
-shipped between processes - only lightweight condition-name tuples travel over
-IPC), so the search scales across every core for both phases. A live progress
-bar (rich) shows candidates examined per level and combos simulated, so
-there's always a clear sense of how far a run has gotten.
+Performance - full CPU parallelism, for EVERY phase, including candidate
+generation itself: the size-1 warm-up simulation, extending survivors into
+new candidates, the fire-count prefilter, and the bar-by-bar trade simulation
+are all distributed across a process pool (`n_workers`, default = every CPU
+core). Two bottlenecks had to be eliminated to get here, both single-threaded
+work left running in the main process while workers sat idle at 0% CPU:
+(1) building the (parent, extra-condition) candidate list was originally a
+plain Python loop in the main process - now each worker extends its own
+slice of parent combos directly (one incremental AND per extra condition);
+(2) deduping cross-parent duplicates (two different parents reaching the same
+child) via `frozenset(combo)` was, at scale (hundreds of millions of raw
+candidates), an even bigger single-threaded cost than (1) - eliminated
+entirely by giving every pool name a fixed CANONICAL rank and only ever
+extending with names ranked after a combo's own highest member (the same
+trick `itertools.combinations` uses internally), which makes every
+(parent, extra-condition) pair produce a distinct child - no two parents can
+ever reach the same k-combo, so there is nothing left to dedup. Each worker
+is initialized once with the OHLC arrays, condition pools, and the canonical
+name ranks (not a full DataFrame, and masks are never shipped between
+processes - only lightweight condition-name tuples travel over IPC). A live
+progress bar (rich) shows candidates examined per level and combos simulated,
+so there's always a clear sense of how far a run has gotten.
 """
 
 import os
@@ -77,10 +86,12 @@ OHLCV_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 _WORKER_STATE = {}
 
 
-def _init_worker(pools_by_direction, ohlc, params):
+def _init_worker(pools_by_direction, ohlc, params, names_list_by_direction, name_rank_by_direction):
     _WORKER_STATE["pools"] = pools_by_direction
     _WORKER_STATE["ohlc"] = ohlc
     _WORKER_STATE["params"] = params
+    _WORKER_STATE["names_list"] = names_list_by_direction
+    _WORKER_STATE["name_rank"] = name_rank_by_direction
 
 
 def _mask_for(pool, combo):
@@ -90,21 +101,35 @@ def _mask_for(pool, combo):
     return mask
 
 
-def _filter_batch(tasks):
-    """Generation-phase worker: tasks is a list of (direction, combo_names).
-    Recomputes each combo's mask from the resident pool and checks min_fires -
-    this is the cheap prefilter, run in parallel across every core. Returns
-    (survivors, examined_count) where survivors is [(direction, combo_names,
-    fires), ...] for combos that cleared min_fires."""
-    pools = _WORKER_STATE["pools"]
+def _extend_and_filter_batch(args):
+    """Generation-phase worker: args is (direction, parent_combos_chunk).
+    Every combo is kept in a fixed CANONICAL order (each pool name has a
+    permanent rank, assigned once in _generate_tasks) - a parent only ever
+    extends with names ranked AFTER its own highest-ranked member. This is the
+    same trick itertools.combinations uses internally: it makes every
+    (parent, extra-condition) pair produce a distinct child, so no two
+    different parents can ever reach the same k-combo - eliminating the
+    need for ANY dedup pass (which, at scale, was itself a single-threaded
+    bottleneck worse than the candidate generation it replaced). Extends with
+    one incremental AND onto the parent's own mask, not recomputed from
+    scratch. Returns (survivors, examined_count)."""
+    direction, parent_chunk = args
+    pool = _WORKER_STATE["pools"][direction]
     min_fires = _WORKER_STATE["params"]["min_fires"]
+    rank = _WORKER_STATE["name_rank"][direction]
+    names_list = _WORKER_STATE["names_list"][direction]
 
     survivors = []
-    for direction, combo in tasks:
-        fires = int(np.count_nonzero(_mask_for(pools[direction], combo)))
-        if fires >= min_fires:
-            survivors.append((direction, combo, fires))
-    return survivors, len(tasks)
+    examined = 0
+    for combo_names in parent_chunk:
+        parent_mask = _mask_for(pool, combo_names)
+        start = rank[combo_names[-1]] + 1
+        for name in names_list[start:]:
+            examined += 1
+            fires = int(np.count_nonzero(parent_mask & pool[name]))
+            if fires >= min_fires:
+                survivors.append((direction, combo_names + (name,), fires))
+    return survivors, examined
 
 
 def _evaluate_batch(tasks):
@@ -154,8 +179,9 @@ def _evaluate_batch(tasks):
 
 class ComboBacktester:
     """Exhaustively searches indicator-condition + price-action-signal
-    combinations and backtests each one for real PnL, in parallel, with no
-    random sampling.
+    combinations and backtests each one for real PnL, in parallel. Never
+    randomly samples - when a level is too large to fully explore, it keeps
+    the combos built from the highest-quality individual conditions.
 
     Usage:
         ComboBacktester(df).print_report()
@@ -194,19 +220,20 @@ class ComboBacktester:
         # Every core, not cpu_count-1: this machine's other work can wait
         # while a search runs - maximize throughput, not responsiveness.
         self.n_workers = n_workers or os.cpu_count() or 1
-        # Two independent safety ceilings, checked BEFORE any sampling would
-        # ever be needed: max_raw_candidates_per_level bounds how many
-        # (parent, extra-condition) pairs get generated+deduped+checked at a
-        # level (the pre-filter cost); max_survivors_per_level bounds how many
-        # confirmed combos get carried into the next level / final simulation
-        # (the expensive cost). If EITHER would be exceeded, the search stops
-        # cleanly at the last fully-completed size for that direction and
-        # says so - it never keeps a partial or random slice.
+        # max_raw_candidates_per_level is a defensive-only ceiling now (raw
+        # candidates at a level = previous survivors * pool size, and
+        # survivors are always trimmed to max_survivors_per_level, so this
+        # almost never triggers in practice - it only guards the pathological
+        # case of an enormous pool with a tiny min_fires making even the FIRST
+        # extension explode). max_survivors_per_level is the real, expected-to-
+        # trigger lever: how many combos carry forward into the next size when
+        # more than that cleared min_fires - see the module docstring for how
+        # the kept ones are chosen (quality-ranked, never random).
         self.max_raw_candidates_per_level = max_raw_candidates_per_level
         self.max_survivors_per_level = max_survivors_per_level
         self.stats = {}
         self.max_size_reached = {}
-        self.stopped_levels = []
+        self.trimmed_levels = []
 
     # ------------------------------------------------------------------
     # Build the long/short condition + signal pools
@@ -277,70 +304,114 @@ class ComboBacktester:
     # ------------------------------------------------------------------
     # Search + backtest
     # ------------------------------------------------------------------
-    def _generate_tasks(self, pools_by_direction, executor, progress):
-        """Apriori-style level-wise search, parallelized across every core.
-        At each level: build the raw (parent, extra-condition) candidate list
-        by extending every previous-level survivor, dedup it, then farm the
-        fire-count check out to the process pool. If the raw candidate count
-        or the survivor count would blow past its ceiling, stop THIS
-        direction here (last complete size is size-1 fewer) - never sample."""
-        tasks = []
+    def _simulate_tasks(self, tasks, executor, progress, description):
+        """Runs _evaluate_batch over `tasks` in parallel with a progress bar.
+        Returns (rows, simulated_count). Shared by the size-1 warm-up pass and
+        the final simulation pass so both report progress the same way."""
+        if not tasks:
+            return [], 0
+        chunk_size = max(50, len(tasks) // (self.n_workers * 8) or 1)
+        chunks = [tasks[i : i + chunk_size] for i in range(0, len(tasks), chunk_size)]
+        task_id = progress.add_task(description, total=len(tasks))
+        rows = []
+        simulated = 0
+        for chunk, (batch_rows, batch_simulated) in zip(chunks, executor.map(_evaluate_batch, chunks)):
+            rows.extend(batch_rows)
+            simulated += batch_simulated
+            progress.update(task_id, advance=len(chunk))
+        progress.remove_task(task_id)
+        return rows, simulated
+
+    def _generate_tasks(self, pools_by_direction, names_list_by_direction, name_rank_by_direction, executor, progress):
+        """Apriori-style level-wise search, parallelized across every core -
+        including candidate generation itself, via a CANONICAL ordering (each
+        pool name has a fixed rank; a combo only ever extends with names
+        ranked after its own highest member - the same trick
+        itertools.combinations uses internally). This makes every
+        (parent, extra-condition) pair produce a distinct child, so no two
+        parents can ever reach the same k-combo - there is NO dedup step,
+        which at scale was itself a single-threaded bottleneck worse than the
+        generation loop it followed. Size-1 conditions are simulated
+        immediately (not deferred) so each one has a real, own total_pnl to
+        use as a quality score. At each later level: farm candidate
+        generation + the fire-count check out to the process pool, then - if
+        there are more survivors than max_survivors_per_level - keep the ones
+        whose member conditions have the highest SUMMED quality score (never
+        a random slice) and continue extending from those."""
+        tasks = []           # (direction, combo_names) for sizes 2+ awaiting final simulation
+        warm_rows = []        # already-simulated size-1 rows (reused directly, not re-simulated)
         tested = 0
         cleared = 0
+        simulated_count = 0
         max_size_reached = {}
-        stopped_levels = []
+        trimmed_levels = []
 
         for direction, pool in pools_by_direction.items():
-            names_list = list(pool.keys())
+            names_list = names_list_by_direction[direction]
+            name_rank = name_rank_by_direction[direction]
             label = "long" if direction == 1 else "short"
 
-            # Size 1: every pool entry already clears min_fires by construction (_build_pools).
-            current_combos = [(name,) for name in names_list]
+            # Size 1: simulate NOW so every condition has a real quality score
+            # (its own standalone total_pnl) to rank deeper combos by later.
+            size1_tasks = [(direction, (name,)) for name in names_list]
+            size1_rows, size1_simulated = self._simulate_tasks(
+                size1_tasks, executor, progress, f"[{label}] size 1: simulating (quality scores)"
+            )
+            simulated_count += size1_simulated
+            tested += len(size1_tasks)
+            cleared += len(size1_tasks)
+
+            condition_score = {row["conditions"][0]: row["total_pnl"] for row in size1_rows}
             if self.min_combo_size <= 1:
-                tasks.extend((direction, c) for c in current_combos)
-            tested += len(current_combos)
-            cleared += len(current_combos)
+                warm_rows.extend(size1_rows)
+
+            current_combos = [(name,) for name in names_list]
             size_reached = 1
+
+            def combo_score(combo_names, _scores=condition_score):
+                return sum(_scores.get(name, 0.0) for name in combo_names)
 
             size = 1
             while current_combos and size < self.max_combo_size:
                 size += 1
 
-                seen = set()
-                raw_candidates = []
-                for combo_names in current_combos:
-                    used = set(combo_names)
-                    for name in names_list:
-                        if name in used:
-                            continue
-                        new_names = combo_names + (name,)
-                        key = frozenset(new_names)
-                        if key in seen:
-                            continue
-                        seen.add(key)
-                        raw_candidates.append((direction, new_names))
-
-                raw_count = len(raw_candidates)
-                if raw_count > self.max_raw_candidates_per_level:
-                    stopped_levels.append((direction, size, "raw_candidates", raw_count, self.max_raw_candidates_per_level))
+                # Exact count (cheap: one pass over the current frontier) of
+                # how many extensions canonical ordering will actually try -
+                # each combo only extends with names ranked after its own max.
+                pool_size = len(names_list)
+                raw_estimate = sum(pool_size - name_rank[c[-1]] - 1 for c in current_combos)
+                if raw_estimate > self.max_raw_candidates_per_level:
+                    trimmed_levels.append((direction, size, "raw_candidates", raw_estimate, self.max_raw_candidates_per_level, 0))
                     current_combos = []
                     break
 
-                tested += raw_count
-                chunk_size = max(200, raw_count // (self.n_workers * 8) or 1)
-                chunks = [raw_candidates[i : i + chunk_size] for i in range(0, raw_count, chunk_size)]
+                # Distribute candidate generation + fire-count filtering across
+                # every core - each worker gets a slice of PARENT combos and
+                # extends+filters them independently. No dedup needed (see
+                # docstring): canonical ordering means every survivor here is
+                # already unique.
+                n_chunks = max(1, min(len(current_combos), self.n_workers * 4))
+                chunk_size = max(1, -(-len(current_combos) // n_chunks))
+                parent_chunks = [current_combos[i : i + chunk_size] for i in range(0, len(current_combos), chunk_size)]
+                tasks_for_workers = [(direction, chunk) for chunk in parent_chunks]
 
-                task_id = progress.add_task(f"[{label}] size {size}: filtering", total=raw_count)
+                task_id = progress.add_task(f"[{label}] size {size}: extending + filtering", total=raw_estimate)
                 survivors = []
-                for batch_survivors, examined in executor.map(_filter_batch, chunks):
+                examined_total = 0
+                for batch_survivors, examined in executor.map(_extend_and_filter_batch, tasks_for_workers):
                     survivors.extend(batch_survivors)
+                    examined_total += examined
                     progress.update(task_id, advance=examined)
                 progress.remove_task(task_id)
+                tested += examined_total
 
-                if len(survivors) > self.max_survivors_per_level:
-                    stopped_levels.append((direction, size, "survivors", len(survivors), self.max_survivors_per_level))
-                    current_combos = []
-                    break
+                original_count = len(survivors)
+                if original_count > self.max_survivors_per_level:
+                    survivors.sort(key=lambda item: combo_score(item[1]), reverse=True)
+                    survivors = survivors[: self.max_survivors_per_level]
+                    trimmed_levels.append(
+                        (direction, size, "survivors", original_count, self.max_survivors_per_level, len(survivors))
+                    )
 
                 cleared += len(survivors)
                 next_combos = [combo_names for (_, combo_names, _fires) in survivors]
@@ -353,13 +424,13 @@ class ComboBacktester:
             max_size_reached[direction] = size_reached
 
         self.max_size_reached = max_size_reached
-        self.stopped_levels = stopped_levels
-        return tasks, tested, cleared
+        self.trimmed_levels = trimmed_levels
+        return tasks, warm_rows, tested, cleared, simulated_count
 
     def run(self):
-        """Backtest every qualifying combination, at every size, exhaustively
-        and in parallel - no random sampling. Returns a DataFrame (both
-        winning and losing combos that cleared min_fires), best PnL first."""
+        """Backtest every qualifying combination, at every size. Returns a
+        DataFrame (both winning and losing combos that cleared min_fires),
+        best PnL first."""
         long_pool, short_pool = self._build_pools()
         pools_by_direction = {1: long_pool, -1: short_pool}
 
@@ -379,6 +450,14 @@ class ComboBacktester:
             "min_fires": self.min_fires,
         }
 
+        # Fixed canonical order per direction, assigned once - see
+        # _extend_and_filter_batch's docstring for why this eliminates the
+        # need for any dedup pass during the search.
+        names_list_by_direction = {d: list(pool.keys()) for d, pool in pools_by_direction.items()}
+        name_rank_by_direction = {
+            d: {name: i for i, name in enumerate(names)} for d, names in names_list_by_direction.items()
+        }
+
         console = Console(width=220)
         progress_columns = (
             SpinnerColumn(),
@@ -389,11 +468,14 @@ class ComboBacktester:
             TimeRemainingColumn(),
         )
 
-        rows = []
         with Progress(*progress_columns, console=console) as progress, ProcessPoolExecutor(
-            max_workers=self.n_workers, initializer=_init_worker, initargs=(pools_by_direction, ohlc, params)
+            max_workers=self.n_workers,
+            initializer=_init_worker,
+            initargs=(pools_by_direction, ohlc, params, names_list_by_direction, name_rank_by_direction),
         ) as executor:
-            tasks, tested, cleared_prefilter = self._generate_tasks(pools_by_direction, executor, progress)
+            tasks, warm_rows, tested, cleared_prefilter, simulated_count = self._generate_tasks(
+                pools_by_direction, names_list_by_direction, name_rank_by_direction, executor, progress
+            )
 
             self.stats = {
                 "long_pool_size": len(long_pool),
@@ -401,20 +483,14 @@ class ComboBacktester:
                 "dropped_columns": len(self.dropped_columns),
                 "combos_tested": tested,
                 "combos_cleared_min_fires": cleared_prefilter,
-                "combos_simulated": 0,
+                "combos_simulated": simulated_count,
             }
 
-            if not tasks:
-                return pd.DataFrame()
-
-            chunk_size = max(50, len(tasks) // (self.n_workers * 8))
-            chunks = [tasks[i : i + chunk_size] for i in range(0, len(tasks), chunk_size)]
-
-            task_id = progress.add_task("Simulating trades", total=len(tasks))
-            for chunk, (batch_rows, simulated) in zip(chunks, executor.map(_evaluate_batch, chunks)):
-                rows.extend(batch_rows)
-                self.stats["combos_simulated"] += simulated
-                progress.update(task_id, advance=len(chunk))
+            rows = list(warm_rows)
+            if tasks:
+                final_rows, final_simulated = self._simulate_tasks(tasks, executor, progress, "Simulating trades")
+                rows.extend(final_rows)
+                self.stats["combos_simulated"] += final_simulated
 
         result = pd.DataFrame(rows)
         if not result.empty:
@@ -429,7 +505,7 @@ class ComboBacktester:
             f"[bold]COMBO BACKTEST[/bold] - long pool {self.stats['long_pool_size']}, "
             f"short pool {self.stats['short_pool_size']} conditions/signals "
             f"({self.stats['dropped_columns']} dropped - constant, never fired, or below {self.min_fires} fires), "
-            f"exhaustive Apriori search sizes {self.min_combo_size}-{self.max_combo_size} "
+            f"Apriori search sizes {self.min_combo_size}-{self.max_combo_size} "
             f"(ceiling), {self.n_workers} parallel workers (all cores)"
         )
         console.print(
@@ -441,16 +517,21 @@ class ComboBacktester:
             reached = self.max_size_reached.get(direction)
             if reached is not None:
                 note = " (hit the max_combo_size ceiling)" if reached == self.max_combo_size else " (search died out naturally - no combo of the next size clears min_fires)"
-                console.print(f"  {label} pool: fully exhaustive through size {reached}{note}")
-        for direction, size, reason, count, limit in self.stopped_levels:
+                console.print(f"  {label} pool: reached size {reached}{note}")
+        for direction, size, reason, original_count, limit, kept_count in self.trimmed_levels:
             label = "long" if direction == 1 else "short"
-            what = "raw candidates to check" if reason == "raw_candidates" else "combos cleared min_fires"
-            console.print(
-                f"  [red]stopped[/red] {label} at size {size}: would need to process {count:,} {what}, "
-                f"over the {limit:,} ceiling - NOT sampled or truncated, search simply stops here so every "
-                f"size actually reported stays 100% exhaustive. Raise the relevant limit, raise min_fires, "
-                f"or lower max_combo_size to go further."
-            )
+            if reason == "raw_candidates":
+                console.print(
+                    f"  [red]stopped[/red] {label} at size {size}: {original_count:,} raw candidates to check, "
+                    f"over the {limit:,} ceiling - this direction stops here (raise max_raw_candidates_per_level "
+                    f"or min_fires to go further)."
+                )
+            else:
+                console.print(
+                    f"  [yellow]trimmed[/yellow] {label} size-{size}: {original_count:,} combos cleared min_fires, "
+                    f"kept the {kept_count:,} built from the highest-quality conditions (by each condition's own "
+                    f"standalone total_pnl) - NOT random, but not exhaustive either at/beyond this size."
+                )
 
         if result.empty:
             console.print("No combination cleared the minimum fire count.")
