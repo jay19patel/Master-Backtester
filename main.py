@@ -42,7 +42,7 @@ COMBO_MIN_SIZE = 3
 # every size exhaustively (1, 1+2, 1+2+3, ...) and stops on its own the moment
 # no combo of a size can clear COMBO_MIN_FIRES anymore. This just bounds how
 # far it's allowed to go if conditions turn out to be highly correlated.
-COMBO_MAX_SIZE = 100
+COMBO_MAX_SIZE = 10
 COMBO_MIN_FIRES = 15
 COMBO_CONSOLE_TOP_N = 20
 COMBO_N_WORKERS = None  # None = every CPU core (max throughput over responsiveness)
@@ -51,8 +51,8 @@ COMBO_N_WORKERS = None  # None = every CPU core (max throughput over responsiven
 # Raise these if you have RAM/time to spare and want the search to reach
 # further before stopping; report.json/console always say exactly where and
 # why it stopped.
-COMBO_MAX_RAW_CANDIDATES_PER_LEVEL = 20_000_000
-COMBO_MAX_SURVIVORS_PER_LEVEL = 2_000_000
+COMBO_MAX_RAW_CANDIDATES_PER_LEVEL = 300_000_000
+COMBO_MAX_SURVIVORS_PER_LEVEL = 30_000_000
 
 RUN_JSON_EXPORT = True
 JSON_EXPORT_PATH = "report.json"

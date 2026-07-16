@@ -146,6 +146,34 @@
 
   .chart-panel svg { display: block; }
   .chart-meta { color: var(--text-dim); font-size: 0.78rem; margin-top: 6px; }
+  .chart-panel { position: relative; }
+
+  .filters-toolbar { display: flex; gap: 18px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+  .filter-group { display: flex; gap: 6px; }
+  .filter-btn {
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--text-dim);
+    padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 0.85rem;
+  }
+  .filter-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .filter-input { display: flex; align-items: center; gap: 6px; font-size: 0.82rem; color: var(--text-dim); }
+  .filter-input input {
+    width: 72px; background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+    padding: 5px 8px; border-radius: 6px; font-size: 0.85rem;
+  }
+  .reset-btn {
+    background: transparent; border: 1px solid var(--border); color: var(--text-dim);
+    padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 0.82rem;
+  }
+  .reset-btn:hover { color: var(--text); border-color: var(--accent); }
+  .filter-count { color: var(--text-dim); font-size: 0.82rem; margin-left: auto; }
+
+  .scatter-tooltip {
+    position: absolute; pointer-events: none; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 10px; font-size: 0.78rem; color: var(--text);
+    box-shadow: 0 2px 10px rgba(0,0,0,0.25); z-index: 10; white-space: nowrap;
+  }
+  .legend { display: flex; gap: 18px; margin-top: 8px; font-size: 0.8rem; color: var(--text-dim); }
+  .legend .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
 
   .warning-banner {
     background: rgba(224, 185, 58, 0.12);
@@ -208,9 +236,17 @@
       <p class="note">Every indicator condition (compared to its own trailing rolling median) exhaustively crossed with every other indicator condition and price-action signal - ALL must agree on direction on the same candle - and backtested for real PnL the same realistic way as a single signal (entry at next open, stop/target bracket, risk-based sizing, fees). Most combinations naturally get zero/few fires since requiring several conditions to align exactly is rare; only profitable combinations are shown below, ranked by total PnL so the biggest profit/capital-growth combination is always row 1.</p>
       <div class="cards" id="combo-config-cards"></div>
       <div class="callout" id="combo-best-callout"></div>
-      <h2>Top profitable combinations by total PnL</h2>
+
+      <h2>Filters</h2>
+      <div class="panel" id="combo-filters"></div>
+
+      <h2>Win rate vs return - find your best combo</h2>
+      <p class="note">Every filtered combo plotted at (win rate%, return%) - top-right is what you want: high win rate AND high return. Point color is direction. Hover a point for its full combo.</p>
+      <div class="panel chart-panel" id="combo-scatter-chart"></div>
+
+      <h2>Top combinations by total PnL</h2>
       <div class="panel chart-panel" id="combo-bar-chart"></div>
-      <h2 id="combo-table-title">Top profitable combinations</h2>
+      <h2 id="combo-table-title">Combinations</h2>
       <div id="combo-table-container"></div>
     </section>
   </main>
@@ -345,6 +381,136 @@
         (opts.label || "value") + ": min " + fmt(min, 2) + "  •  max " + fmt(max, 2) + "  •  " + values.length + " points",
       ])
     );
+  }
+
+  // Scatter plot: items = [{ x, y, color, label, meta }]. color is a CSS color
+  // string (e.g. "var(--green)") - the caller decides the categorical mapping
+  // so this stays reusable. A hard cap on point count keeps the SVG (and the
+  // browser) responsive when thousands of combos match the current filters -
+  // capping is always stated in chart-meta, never silent.
+  function renderScatterChart(container, items, opts) {
+    opts = opts || {};
+    var width = opts.width || 900;
+    var height = opts.height || 420;
+    var padding = 44;
+    var maxPoints = opts.maxPoints || 2000;
+    container.innerHTML = "";
+    container.style.position = "relative";
+
+    if (!items.length) {
+      container.appendChild(el("p", { class: "note" }, ["No combos match the current filters."]));
+      return;
+    }
+
+    var shown = items;
+    var wasCapped = false;
+    if (items.length > maxPoints) {
+      // Keep the best-by-value spread: sort by y (return%) desc and take a
+      // stride through the list so both strong and weak points still show,
+      // rather than only ever showing the single best cluster.
+      var sorted = items.slice().sort(function (a, b) { return b.y - a.y; });
+      var stride = Math.ceil(sorted.length / maxPoints);
+      shown = sorted.filter(function (_, i) { return i % stride === 0; });
+      wasCapped = true;
+    }
+
+    var xs = shown.map(function (it) { return it.x; });
+    var ys = shown.map(function (it) { return it.y; });
+    var xMin = Math.min.apply(null, xs), xMax = Math.max.apply(null, xs);
+    var yMin = Math.min.apply(null, ys), yMax = Math.max.apply(null, ys);
+    var xPad = (xMax - xMin) * 0.05 || 1;
+    var yPad = (yMax - yMin) * 0.05 || 1;
+    xMin -= xPad; xMax += xPad; yMin -= yPad; yMax += yPad;
+    var xRange = (xMax - xMin) || 1;
+    var yRange = (yMax - yMin) || 1;
+
+    function xPos(v) { return padding + (v - xMin) / xRange * (width - 2 * padding); }
+    function yPos(v) { return height - padding - (v - yMin) / yRange * (height - 2 * padding); }
+
+    var svgNS = "http://www.w3.org/2000/svg";
+    var svg = document.createElementNS(svgNS, "svg");
+    svg.setAttribute("viewBox", "0 0 " + width + " " + height);
+    svg.setAttribute("width", "100%");
+    svg.setAttribute("height", height);
+
+    var xAxis = document.createElementNS(svgNS, "line");
+    xAxis.setAttribute("x1", padding); xAxis.setAttribute("x2", width - padding);
+    xAxis.setAttribute("y1", height - padding); xAxis.setAttribute("y2", height - padding);
+    xAxis.setAttribute("stroke", "currentColor"); xAxis.setAttribute("opacity", "0.3");
+    svg.appendChild(xAxis);
+    var yAxis = document.createElementNS(svgNS, "line");
+    yAxis.setAttribute("x1", padding); yAxis.setAttribute("x2", padding);
+    yAxis.setAttribute("y1", padding); yAxis.setAttribute("y2", height - padding);
+    yAxis.setAttribute("stroke", "currentColor"); yAxis.setAttribute("opacity", "0.3");
+    svg.appendChild(yAxis);
+
+    if (yMin < 0 && yMax > 0) {
+      var zy = yPos(0);
+      var zeroLine = document.createElementNS(svgNS, "line");
+      zeroLine.setAttribute("x1", padding); zeroLine.setAttribute("x2", width - padding);
+      zeroLine.setAttribute("y1", zy.toFixed(2)); zeroLine.setAttribute("y2", zy.toFixed(2));
+      zeroLine.setAttribute("stroke", "currentColor"); zeroLine.setAttribute("stroke-dasharray", "4,4");
+      zeroLine.setAttribute("opacity", "0.35");
+      svg.appendChild(zeroLine);
+    }
+
+    var xLabel = document.createElementNS(svgNS, "text");
+    xLabel.setAttribute("x", width - padding); xLabel.setAttribute("y", height - padding + 20);
+    xLabel.setAttribute("text-anchor", "end");
+    xLabel.setAttribute("fill", "currentColor"); xLabel.setAttribute("opacity", "0.6"); xLabel.setAttribute("font-size", "11");
+    xLabel.textContent = opts.xLabel || "x";
+    svg.appendChild(xLabel);
+    var yLabel = document.createElementNS(svgNS, "text");
+    yLabel.setAttribute("x", 4); yLabel.setAttribute("y", padding - 12);
+    yLabel.setAttribute("fill", "currentColor"); yLabel.setAttribute("opacity", "0.6"); yLabel.setAttribute("font-size", "11");
+    yLabel.textContent = opts.yLabel || "y";
+    svg.appendChild(yLabel);
+
+    var tooltip = el("div", { class: "scatter-tooltip" });
+    tooltip.style.display = "none";
+
+    shown.forEach(function (it) {
+      var c = document.createElementNS(svgNS, "circle");
+      c.setAttribute("cx", xPos(it.x).toFixed(2));
+      c.setAttribute("cy", yPos(it.y).toFixed(2));
+      c.setAttribute("r", 4.5);
+      c.setAttribute("fill", it.color || "var(--accent)");
+      c.setAttribute("fill-opacity", "0.7");
+      c.setAttribute("stroke", "var(--panel)");
+      c.setAttribute("stroke-width", "1");
+      c.style.cursor = "pointer";
+      c.addEventListener("mouseenter", function () {
+        tooltip.innerHTML = (it.label || "") + (it.meta ? "<br>" + it.meta : "");
+        tooltip.style.display = "block";
+      });
+      c.addEventListener("mousemove", function (e) {
+        var rect = container.getBoundingClientRect();
+        var left = e.clientX - rect.left + 14;
+        var top = e.clientY - rect.top + 14;
+        tooltip.style.left = left + "px";
+        tooltip.style.top = top + "px";
+      });
+      c.addEventListener("mouseleave", function () { tooltip.style.display = "none"; });
+      svg.appendChild(c);
+    });
+
+    container.appendChild(svg);
+    container.appendChild(tooltip);
+
+    if (opts.legend && opts.legend.length) {
+      var legend = el("div", { class: "legend" });
+      opts.legend.forEach(function (item) {
+        legend.appendChild(el("span", {}, [
+          el("span", { class: "swatch", style: "background:" + item.color }),
+          item.label,
+        ]));
+      });
+      container.appendChild(legend);
+    }
+
+    var metaText = shown.length + (opts.itemNoun ? " " + opts.itemNoun : " points") + " plotted";
+    if (wasCapped) metaText += " (sampled from " + items.length.toLocaleString() + " matching - too many to plot at once)";
+    container.appendChild(el("div", { class: "chart-meta" }, [metaText]));
   }
 
   // ------------------------------------------------------------------
@@ -542,6 +708,113 @@
     return (row.conditions || []).map(function (i) { return dictionary[i]; }).join(" AND ");
   }
 
+  // Filter toolbar (direction / size range / min trades / min win rate) -
+  // shared by the table, bar chart, and scatter chart below it, so all three
+  // views always agree on what's currently in scope.
+  function renderComboFilters(container, allCombos, onChange) {
+    container.innerHTML = "";
+    var sizes = allCombos.map(function (r) { return r.size; });
+    var sizeMin = sizes.length ? Math.min.apply(null, sizes) : "";
+    var sizeMax = sizes.length ? Math.max.apply(null, sizes) : "";
+
+    var state = { direction: "all", minSize: "", maxSize: "", minTrades: "", minWinRate: "" };
+
+    function apply() {
+      var filtered = allCombos.filter(function (r) {
+        if (state.direction !== "all" && r.directionText.toLowerCase() !== state.direction) return false;
+        if (state.minSize !== "" && r.size < Number(state.minSize)) return false;
+        if (state.maxSize !== "" && r.size > Number(state.maxSize)) return false;
+        if (state.minTrades !== "" && r.trades < Number(state.minTrades)) return false;
+        if (state.minWinRate !== "" && r.win_rate_pct < Number(state.minWinRate)) return false;
+        return true;
+      });
+      countEl.textContent = filtered.length.toLocaleString() + " of " + allCombos.length.toLocaleString() + " combos match";
+      onChange(filtered);
+    }
+
+    var dirGroup = el("div", { class: "filter-group" });
+    [["all", "All"], ["long", "Long"], ["short", "Short"]].forEach(function (pair) {
+      var btn = el("button", { class: "filter-btn" + (pair[0] === "all" ? " active" : "") }, [pair[1]]);
+      btn.addEventListener("click", function () {
+        state.direction = pair[0];
+        dirGroup.querySelectorAll(".filter-btn").forEach(function (b) { b.classList.remove("active"); });
+        btn.classList.add("active");
+        apply();
+      });
+      dirGroup.appendChild(btn);
+    });
+
+    function numberInput(labelText, key, placeholder) {
+      var input = el("input", { type: "number", placeholder: placeholder !== undefined ? String(placeholder) : "any" });
+      input.addEventListener("input", function (e) { state[key] = e.target.value; apply(); });
+      return el("label", { class: "filter-input" }, [labelText, input]);
+    }
+
+    var resetBtn = el("button", { class: "reset-btn" }, ["Reset filters"]);
+    resetBtn.addEventListener("click", function () {
+      state = { direction: "all", minSize: "", maxSize: "", minTrades: "", minWinRate: "" };
+      container.querySelectorAll("input").forEach(function (i) { i.value = ""; });
+      dirGroup.querySelectorAll(".filter-btn").forEach(function (b, i) { b.classList.toggle("active", i === 0); });
+      apply();
+    });
+
+    var countEl = el("div", { class: "filter-count" }, [""]);
+
+    container.appendChild(el("div", { class: "filters-toolbar" }, [
+      dirGroup,
+      numberInput("Min size", "minSize", sizeMin),
+      numberInput("Max size", "maxSize", sizeMax),
+      numberInput("Min trades", "minTrades", 0),
+      numberInput("Min win rate%", "minWinRate", 0),
+      resetBtn,
+      countEl,
+    ]));
+
+    apply();
+  }
+
+  function renderComboViews(combos) {
+    var topCombos = combos.slice(0, 10).map(function (r) { return { label: "[" + r.directionText + "] " + r.comboText, value: r.total_pnl }; });
+    renderBarChart(document.getElementById("combo-bar-chart"), topCombos, {
+      valueFormat: function (v) { return (v >= 0 ? "+" : "") + fmt(v, 2); },
+    });
+
+    var scatterPoints = combos.map(function (r) {
+      return {
+        x: r.win_rate_pct,
+        y: r.return_pct,
+        color: r.directionText === "Long" ? "var(--green)" : "var(--red)",
+        label: "[" + r.directionText + "] " + r.comboText,
+        meta: "win_rate " + fmt(r.win_rate_pct, 1) + "% • return " + (r.return_pct >= 0 ? "+" : "") + fmt(r.return_pct, 1) +
+          "% • " + r.trades + " trades • size " + r.size,
+      };
+    });
+    renderScatterChart(document.getElementById("combo-scatter-chart"), scatterPoints, {
+      xLabel: "win rate %",
+      yLabel: "return %",
+      itemNoun: "combos",
+      legend: [
+        { color: "var(--green)", label: "Long" },
+        { color: "var(--red)", label: "Short" },
+      ],
+    });
+
+    var titleEl = document.getElementById("combo-table-title");
+    titleEl.textContent = combos.length.toLocaleString() + " combination" + (combos.length === 1 ? "" : "s");
+
+    renderDataTable(document.getElementById("combo-table-container"), combos, [
+      { key: "directionText", label: "Dir" },
+      { key: "comboText", label: "Combo", text: true },
+      { key: "size", label: "size" },
+      { key: "fires", label: "fires" },
+      { key: "trades", label: "trades" },
+      { key: "win_rate_pct", label: "win_rate%", format: function (v) { return fmt(v, 1); } },
+      { key: "final_equity", label: "final_$", format: function (v) { return fmt(v, 2); } },
+      { key: "total_pnl", label: "total_pnl", format: function (v) { return fmt(v, 2); }, colorize: true },
+      { key: "return_pct", label: "return%", format: function (v) { return fmt(v, 1); }, colorize: true },
+    ], { defaultSort: "total_pnl", defaultDir: "desc" });
+  }
+
   function renderCombo(report) {
     var cb = report.combo_backtest;
     var cfgContainer = document.getElementById("combo-config-cards");
@@ -586,26 +859,7 @@
       calloutContainer.appendChild(el("div", {}, ["No profitable combination found."]));
     }
 
-    var titleEl = document.getElementById("combo-table-title");
-    var found = cfg.profitable_combos_found || combos.length;
-    titleEl.textContent = "All " + combos.length.toLocaleString() + " of " + found.toLocaleString() + " profitable combinations";
-
-    var topCombos = combos.slice(0, 10).map(function (r) { return { label: "[" + r.directionText + "] " + r.comboText, value: r.total_pnl }; });
-    renderBarChart(document.getElementById("combo-bar-chart"), topCombos, {
-      valueFormat: function (v) { return (v >= 0 ? "+" : "") + fmt(v, 2); },
-    });
-
-    renderDataTable(document.getElementById("combo-table-container"), combos, [
-      { key: "directionText", label: "Dir" },
-      { key: "comboText", label: "Combo", text: true },
-      { key: "size", label: "size" },
-      { key: "fires", label: "fires" },
-      { key: "trades", label: "trades" },
-      { key: "win_rate_pct", label: "win_rate%", format: function (v) { return fmt(v, 1); } },
-      { key: "final_equity", label: "final_$", format: function (v) { return fmt(v, 2); } },
-      { key: "total_pnl", label: "total_pnl", format: function (v) { return fmt(v, 2); }, colorize: true },
-      { key: "return_pct", label: "return%", format: function (v) { return fmt(v, 1); }, colorize: true },
-    ], { defaultSort: "total_pnl", defaultDir: "desc" });
+    renderComboFilters(document.getElementById("combo-filters"), combos, renderComboViews);
   }
 
   // ------------------------------------------------------------------
