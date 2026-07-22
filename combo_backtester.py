@@ -67,6 +67,7 @@ so there's always a clear sense of how far a run has gotten.
 """
 
 import os
+import time
 from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
@@ -203,7 +204,8 @@ class ComboBacktester:
         condition_window=100,
         n_workers=None,
         max_raw_candidates_per_level=20_000_000,
-        max_survivors_per_level=2_000_000,
+        max_survivors_per_level=20_000,
+        max_search_seconds=120,
     ):
         self.df = df
         self.initial_capital = initial_capital
@@ -217,20 +219,30 @@ class ComboBacktester:
         self.min_fires = min_fires
         self.console_top_n = console_top_n
         self.condition_window = condition_window
-        # Every core, not cpu_count-1: this machine's other work can wait
-        # while a search runs - maximize throughput, not responsiveness.
-        self.n_workers = n_workers or os.cpu_count() or 1
-        # max_raw_candidates_per_level is a defensive-only ceiling now (raw
-        # candidates at a level = previous survivors * pool size, and
-        # survivors are always trimmed to max_survivors_per_level, so this
-        # almost never triggers in practice - it only guards the pathological
-        # case of an enormous pool with a tiny min_fires making even the FIRST
-        # extension explode). max_survivors_per_level is the real, expected-to-
-        # trigger lever: how many combos carry forward into the next size when
-        # more than that cleared min_fires - see the module docstring for how
-        # the kept ones are chosen (quality-ranked, never random).
+        # Leave a core free for the OS/UI - a search can otherwise peg every
+        # core for minutes and make the whole machine feel unresponsive even
+        # though the process itself is healthy.
+        self.n_workers = n_workers or max(1, (os.cpu_count() or 2) - 1)
+        # Three independent, layered safety nets - any one of them alone was
+        # not enough to guarantee a bounded run in practice:
+        #   max_raw_candidates_per_level - defensive-only ceiling on raw
+        #     extension attempts at a level (rarely triggers - see below).
+        #   max_survivors_per_level - how many combos carry forward into the
+        #     next size when more cleared min_fires than this. Kept low by
+        #     default (20,000, not millions) specifically so a level's own
+        #     work is bounded even before the time budget would kick in.
+        #   max_search_seconds - a hard wall-clock ceiling on the WHOLE
+        #     search (checked between levels): once elapsed time crosses
+        #     this, every direction stops wherever it currently is, no matter
+        #     how large max_survivors_per_level was set. This is the one
+        #     that actually guarantees "never hangs the machine" regardless
+        #     of dataset size, pool size, or how the other two are tuned.
+        # Whichever one trips first, the combos already found are ALWAYS kept
+        # and reported - none of this discards results, it just decides how
+        # much deeper the search is allowed to go looking for more.
         self.max_raw_candidates_per_level = max_raw_candidates_per_level
         self.max_survivors_per_level = max_survivors_per_level
+        self.max_search_seconds = max_search_seconds
         self.stats = {}
         self.max_size_reached = {}
         self.trimmed_levels = []
@@ -350,6 +362,9 @@ class ComboBacktester:
             names_list = names_list_by_direction[direction]
             name_rank = name_rank_by_direction[direction]
             label = "long" if direction == 1 else "short"
+            # Own budget per direction (not a shared/cumulative one) so a slow
+            # long side can't starve the short side of any time at all.
+            direction_start = time.monotonic()
 
             # Size 1: simulate NOW so every condition has a real quality score
             # (its own standalone total_pnl) to rank deeper combos by later.
@@ -373,6 +388,10 @@ class ComboBacktester:
 
             size = 1
             while current_combos and size < self.max_combo_size:
+                elapsed = time.monotonic() - direction_start
+                if elapsed > self.max_search_seconds:
+                    trimmed_levels.append((direction, size, "time_budget", 0, self.max_search_seconds, 0))
+                    break
                 size += 1
 
                 # Exact count (cheap: one pass over the current frontier) of
@@ -520,7 +539,13 @@ class ComboBacktester:
                 console.print(f"  {label} pool: reached size {reached}{note}")
         for direction, size, reason, original_count, limit, kept_count in self.trimmed_levels:
             label = "long" if direction == 1 else "short"
-            if reason == "raw_candidates":
+            if reason == "time_budget":
+                console.print(
+                    f"  [red]time budget[/red] {label} stopped before size {size}: this direction had "
+                    f"{limit:,}s and used it - whatever was found through the previous size is kept, "
+                    f"deeper sizes simply weren't reached. Raise max_search_seconds for a longer run."
+                )
+            elif reason == "raw_candidates":
                 console.print(
                     f"  [red]stopped[/red] {label} at size {size}: {original_count:,} raw candidates to check, "
                     f"over the {limit:,} ceiling - this direction stops here (raise max_raw_candidates_per_level "

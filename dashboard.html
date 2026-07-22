@@ -160,6 +160,11 @@
     width: 72px; background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
     padding: 5px 8px; border-radius: 6px; font-size: 0.85rem;
   }
+  .filter-input select {
+    max-width: 420px; background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+    padding: 5px 8px; border-radius: 6px; font-size: 0.85rem;
+  }
+  code { background: var(--panel-2); padding: 1px 6px; border-radius: 4px; font-size: 0.85em; }
   .reset-btn {
     background: transparent; border: 1px solid var(--border); color: var(--text-dim);
     padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 0.82rem;
@@ -248,6 +253,27 @@
       <div class="panel chart-panel" id="combo-bar-chart"></div>
       <h2 id="combo-table-title">Combinations</h2>
       <div id="combo-table-container"></div>
+    </section>
+
+    <section class="tab" data-tab="finalbacktest">
+      <h2>Final backtest</h2>
+      <p class="note" id="fb-intro">Pick one Long strategy and one Short strategy (defaults to whichever has the highest total PnL on each side) - the result below is ONE combined, single-account backtest: when the Long strategy's signal fires it takes a long trade, when the Short strategy's signal fires it takes a short trade, both on the same equity curve. Run <code>python3 finalbacktesting.py</code> to (re)generate this data.</p>
+      <div id="fb-missing" class="panel" style="display:none;"><p class="note">final_backtest_data.json not found yet - run <code>python3 finalbacktesting.py</code> in the project folder, then reload this page.</p></div>
+      <div id="fb-content" style="display:none;">
+        <div class="filters-toolbar">
+          <label class="filter-input">Long strategy
+            <select id="fb-long-select"></select>
+          </label>
+          <label class="filter-input">Short strategy
+            <select id="fb-short-select"></select>
+          </label>
+        </div>
+        <div class="cards" id="fb-summary-cards"></div>
+        <h2>Combined equity curve</h2>
+        <div class="panel chart-panel" id="fb-equity-chart"></div>
+        <h2 id="fb-trades-title">Trade book</h2>
+        <div id="fb-trades-container"></div>
+      </div>
     </section>
   </main>
 </div>
@@ -631,6 +657,7 @@
   var TABS = [
     { key: "overview", label: "Overview" },
     { key: "combos", label: "Combo Backtest" },
+    { key: "finalbacktest", label: "Final Backtest" },
   ];
 
   function setupNav() {
@@ -863,13 +890,192 @@
   }
 
   // ------------------------------------------------------------------
+  // Final Backtest tab - combined single-account backtest for whichever
+  // Long + Short combo pair is selected. The bar-by-bar simulation below is a
+  // direct port of backtester.py's simulate_trades() - same entry-at-next-
+  // open, same stop/target walk (stop wins a same-candle tie), same
+  // risk-based position sizing, same fees, same no-overlap rule - so this
+  // must be kept in sync with that function if it ever changes.
+  // ------------------------------------------------------------------
+  function maskAt(maskStr, i) {
+    return maskStr.charCodeAt(i) === 49; // '1' === charCode 49
+  }
+
+  function simulateTradesJS(longMask, shortMask, ohlc, times, params) {
+    var n = ohlc.open.length;
+    var equity = params.initial_capital;
+    var trades = [];
+    var i = 0;
+
+    function directionAt(idx) {
+      // Long takes priority on the rare candle where both fire at once.
+      if (maskAt(longMask, idx)) return 1;
+      if (maskAt(shortMask, idx)) return -1;
+      return 0;
+    }
+
+    while (i < n - 1) {
+      var direction = directionAt(i);
+      if (direction === 0) { i += 1; continue; }
+
+      var entryI = i + 1;
+      if (entryI >= n) break;
+      var entryPrice = ohlc.open[entryI];
+      var stopDist = entryPrice * (params.stop_loss_pct / 100);
+      var targetDist = entryPrice * (params.take_profit_pct / 100);
+      var stopPrice, targetPrice;
+      if (direction === 1) {
+        stopPrice = entryPrice - stopDist;
+        targetPrice = entryPrice + targetDist;
+      } else {
+        stopPrice = entryPrice + stopDist;
+        targetPrice = entryPrice - targetDist;
+      }
+
+      var exitPrice = null, exitReason = "time", exitI = Math.min(entryI + params.max_hold_bars, n - 1);
+      for (var j = entryI; j <= exitI; j++) {
+        var hitStop, hitTarget;
+        if (direction === 1) {
+          hitStop = ohlc.low[j] <= stopPrice;
+          hitTarget = ohlc.high[j] >= targetPrice;
+        } else {
+          hitStop = ohlc.high[j] >= stopPrice;
+          hitTarget = ohlc.low[j] <= targetPrice;
+        }
+        if (hitStop) { exitPrice = stopPrice; exitReason = "stop"; exitI = j; break; }
+        if (hitTarget) { exitPrice = targetPrice; exitReason = "target"; exitI = j; break; }
+      }
+      if (exitPrice === null) { exitPrice = ohlc.close[exitI]; exitReason = "time"; }
+
+      var riskDollars = equity * (params.risk_per_trade_pct / 100);
+      var positionSize = riskDollars / stopDist;
+      var rawPnl = positionSize * (exitPrice - entryPrice) * direction;
+      var fee = positionSize * entryPrice * (params.fee_pct / 100) * 2;
+      var pnl = rawPnl - fee;
+      equity += pnl;
+
+      trades.push({
+        direction: direction === 1 ? "LONG" : "SHORT",
+        entryTime: times[entryI],
+        exitTime: times[exitI],
+        entryPrice: entryPrice,
+        exitPrice: exitPrice,
+        exitReason: exitReason,
+        pnl: pnl,
+        equityAfter: equity,
+      });
+
+      i = exitI + 1;
+    }
+    return { trades: trades, finalEquity: equity };
+  }
+
+  function maxDrawdownPctJS(trades) {
+    var peak = null, maxDd = 0;
+    trades.forEach(function (t) {
+      peak = peak === null ? t.equityAfter : Math.max(peak, t.equityAfter);
+      if (peak) maxDd = Math.max(maxDd, (peak - t.equityAfter) / peak * 100);
+    });
+    return maxDd;
+  }
+
+  function renderFinalBacktestResult(fbData, longIdx, shortIdx) {
+    var longCombo = fbData.long_combos[longIdx];
+    var shortCombo = fbData.short_combos[shortIdx];
+    var ohlc = { open: fbData.open, high: fbData.high, low: fbData.low, close: fbData.close };
+    var sim = simulateTradesJS(longCombo.mask, shortCombo.mask, ohlc, fbData.time, fbData.params);
+    var trades = sim.trades;
+    var initialCapital = fbData.params.initial_capital;
+    var totalPnl = sim.finalEquity - initialCapital;
+    var wins = trades.filter(function (t) { return t.pnl > 0; });
+    var winRate = trades.length ? wins.length / trades.length * 100 : 0;
+
+    var cardsContainer = document.getElementById("fb-summary-cards");
+    cardsContainer.innerHTML = "";
+    [
+      ["Final equity", "$" + fmt(sim.finalEquity, 2), totalPnl >= 0 ? "green" : "red"],
+      ["Total PnL", (totalPnl >= 0 ? "+" : "") + fmt(totalPnl, 2) + " (" + (totalPnl >= 0 ? "+" : "") + fmt(totalPnl / initialCapital * 100, 1) + "%)", totalPnl >= 0 ? "green" : "red"],
+      ["Trades", String(trades.length), ""],
+      ["Win rate", fmt(winRate, 1) + "%", ""],
+      ["Max drawdown", fmt(maxDrawdownPctJS(trades), 1) + "%", ""],
+    ].forEach(function (c) {
+      cardsContainer.appendChild(el("div", { class: "card" }, [
+        el("div", { class: "label" }, [c[0]]),
+        el("div", { class: "value" + (c[2] ? " " + c[2] : "") }, [c[1]]),
+      ]));
+    });
+
+    var equityValues = [initialCapital].concat(trades.map(function (t) { return t.equityAfter; }));
+    renderLineChart(document.getElementById("fb-equity-chart"), equityValues, {
+      label: "equity $", baseline: initialCapital,
+    });
+
+    document.getElementById("fb-trades-title").textContent = "Trade book (" + trades.length + " trades)";
+    var tableRows = trades.map(function (t, i) {
+      return {
+        idx: i + 1,
+        entryTime: t.entryTime, exitTime: t.exitTime, direction: t.direction,
+        entryPrice: t.entryPrice, exitPrice: t.exitPrice, exitReason: t.exitReason,
+        pnl: t.pnl, equityAfter: t.equityAfter,
+      };
+    });
+    renderDataTable(document.getElementById("fb-trades-container"), tableRows, [
+      { key: "idx", label: "#" },
+      { key: "entryTime", label: "Entry time", text: true },
+      { key: "exitTime", label: "Exit time", text: true },
+      { key: "direction", label: "Dir", text: true },
+      { key: "entryPrice", label: "Entry $", format: function (v) { return fmt(v, 4); } },
+      { key: "exitPrice", label: "Exit $", format: function (v) { return fmt(v, 4); } },
+      { key: "exitReason", label: "Exit reason", text: true },
+      { key: "pnl", label: "PnL", format: function (v) { return fmt(v, 2); }, colorize: true },
+      { key: "equityAfter", label: "Equity", format: function (v) { return fmt(v, 2); } },
+    ], { defaultSort: "idx", defaultDir: "asc", pageSize: 50 });
+  }
+
+  function renderFinalBacktest(fbData) {
+    var missingEl = document.getElementById("fb-missing");
+    var contentEl = document.getElementById("fb-content");
+    if (!fbData || !fbData.long_combos || !fbData.long_combos.length || !fbData.short_combos || !fbData.short_combos.length) {
+      missingEl.style.display = "block";
+      contentEl.style.display = "none";
+      return;
+    }
+    missingEl.style.display = "none";
+    contentEl.style.display = "block";
+
+    var longSelect = document.getElementById("fb-long-select");
+    var shortSelect = document.getElementById("fb-short-select");
+    longSelect.innerHTML = "";
+    shortSelect.innerHTML = "";
+
+    fbData.long_combos.forEach(function (c, i) {
+      longSelect.appendChild(el("option", { value: String(i) }, [
+        c.combo + "  (+" + fmt(c.total_pnl, 2) + ", " + c.trades + " trades)",
+      ]));
+    });
+    fbData.short_combos.forEach(function (c, i) {
+      shortSelect.appendChild(el("option", { value: String(i) }, [
+        c.combo + "  (+" + fmt(c.total_pnl, 2) + ", " + c.trades + " trades)",
+      ]));
+    });
+
+    function update() {
+      renderFinalBacktestResult(fbData, Number(longSelect.value), Number(shortSelect.value));
+    }
+    longSelect.addEventListener("change", update);
+    shortSelect.addEventListener("change", update);
+    update();
+  }
+
+  // ------------------------------------------------------------------
   // Boot
   // ------------------------------------------------------------------
-  function init(report) {
+  function init(report, fbData) {
     REPORT = report;
     setupNav();
     renderOverview(report);
     renderCombo(report);
+    renderFinalBacktest(fbData);
     document.getElementById("app").style.display = "block";
   }
 
@@ -886,12 +1092,19 @@
       "<p>Then open <code>http://localhost:8000/dashboard.html</code> in your browser.</p>";
   }
 
-  fetch("report.json")
-    .then(function (response) {
+  // final_backtest_data.json is optional (only exists once you've run
+  // finalbacktesting.py) - fetched independently so its absence never blocks
+  // the rest of the dashboard from loading.
+  Promise.all([
+    fetch("report.json").then(function (response) {
       if (!response.ok) throw new Error("HTTP " + response.status);
       return response.json();
-    })
-    .then(init)
+    }),
+    fetch("final_backtest_data.json")
+      .then(function (response) { return response.ok ? response.json() : null; })
+      .catch(function () { return null; }),
+  ])
+    .then(function (results) { init(results[0], results[1]); })
     .catch(function (err) { showError(err.message); });
 })();
 </script>

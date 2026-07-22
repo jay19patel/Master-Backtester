@@ -38,21 +38,24 @@ BACKTEST_FEE_PCT = 0.05
 
 RUN_COMBO_BACKTEST = True
 COMBO_MIN_SIZE = 3
-# Safety ceiling, not a target - the Apriori search (see ComboBacktester) tries
-# every size exhaustively (1, 1+2, 1+2+3, ...) and stops on its own the moment
-# no combo of a size can clear COMBO_MIN_FIRES anymore. This just bounds how
-# far it's allowed to go if conditions turn out to be highly correlated.
+# Safety ceiling, not a target - the search (see ComboBacktester) tries every
+# size (1, 1+2, 1+2+3, ...) and stops on its own once no combo of the next
+# size clears COMBO_MIN_FIRES, OR once COMBO_MAX_SEARCH_SECONDS runs out
+# (whichever comes first). This just bounds how far it's ALLOWED to go.
 COMBO_MAX_SIZE = 10
 COMBO_MIN_FIRES = 15
 COMBO_CONSOLE_TOP_N = 20
-COMBO_N_WORKERS = None  # None = every CPU core (max throughput over responsiveness)
-# Two hard ceilings that make the search stop CLEANLY (never sample/truncate)
-# once a level can't fully complete - see ComboBacktester's module docstring.
-# Raise these if you have RAM/time to spare and want the search to reach
-# further before stopping; report.json/console always say exactly where and
-# why it stopped.
-COMBO_MAX_RAW_CANDIDATES_PER_LEVEL = 300_000_000
-COMBO_MAX_SURVIVORS_PER_LEVEL = 30_000_000
+COMBO_N_WORKERS = None  # None = every CPU core minus one (keeps the machine responsive)
+# Three safety nets that make the search stop CLEANLY (never randomly sample
+# or hang) once a level/run gets too big - see ComboBacktester's module
+# docstring. COMBO_MAX_SEARCH_SECONDS is the one that actually GUARANTEES a
+# bounded run regardless of dataset/pool size - raise it for a longer, deeper
+# search; lower it for a quicker one. Combos already found when a limit trips
+# are always kept - nothing found gets thrown away, the search just stops
+# looking for more. report.json/console always say exactly where and why.
+COMBO_MAX_RAW_CANDIDATES_PER_LEVEL = 20_000_000
+COMBO_MAX_SURVIVORS_PER_LEVEL = 20_000
+COMBO_MAX_SEARCH_SECONDS = 120  # per direction (long/short each get this much)
 
 RUN_JSON_EXPORT = True
 JSON_EXPORT_PATH = "report.json"
@@ -135,6 +138,7 @@ def main():
             n_workers=COMBO_N_WORKERS,
             max_raw_candidates_per_level=COMBO_MAX_RAW_CANDIDATES_PER_LEVEL,
             max_survivors_per_level=COMBO_MAX_SURVIVORS_PER_LEVEL,
+            max_search_seconds=COMBO_MAX_SEARCH_SECONDS,
         )
         precomputed["combo_backtester"] = combo_bt
         precomputed["combo_profitable"] = combo_bt.print_report()

@@ -105,6 +105,11 @@ def simulate_trades(
         equity += pnl
         trade = {
             "direction": "LONG" if direction == 1 else "SHORT",
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "stop_price": stop_price,
+            "target_price": target_price,
+            "position_size": position_size,
             "exit_reason": exit_reason,
             "pnl": pnl,
             "equity_after": equity,
