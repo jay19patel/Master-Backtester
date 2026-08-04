@@ -4,15 +4,9 @@ a single JSON file that `dashboard.html` reads and renders.
 Usage:
     ReportExporter(df, config).save("report.json")
 
-`config` is a plain dict of every setting main.py already has as module-level
-constants (symbol, interval, backtest/combo parameters, which sections to run,
-...) - this module stays independent of main.py so there's no circular import.
-
-Optionally pass `precomputed` (a dict) with analysis results main.py already
-computed for its own console report - this avoids re-running the same
-(expensive) ComboBacktester search a second time just to export it. Any key
-left out is computed fresh here instead. Recognized keys: combo_backtester
-(instance), combo_profitable (DataFrame).
+`config` is a plain dict of main.py's settings, passed in to avoid a circular
+import. Optionally pass `precomputed` (combo_backtester instance,
+combo_profitable DataFrame) to skip re-running the search just to export it.
 """
 
 import json
@@ -45,13 +39,10 @@ def _json_safe(value):
 
 
 def compact_combo_records(df):
-    """ALL combos (no top-N cap), compacted: every condition/signal name used
-    anywhere is deduped into one `condition_dictionary` array, and each combo
-    stores small integer indices into it instead of repeating the full
-    " AND "-joined string - the joined string can be 500+ characters for a
-    large combo, and with every combo now exported (not just a top-2000 slice)
-    that string would dominate file size. The dashboard reconstructs the
-    display string client-side from the dictionary + indices."""
+    """Every combo, compacted: condition/signal names dedup into one
+    `condition_dictionary` array, each combo stores integer indices into it
+    instead of a repeated " AND "-joined string. Dashboard reconstructs the
+    display string client-side."""
     if df is None or len(df) == 0:
         return [], []
 
@@ -128,9 +119,6 @@ class ReportExporter:
             result = combo_bt.run()
             profitable = result[result["total_pnl"] > 0] if not result.empty else result
 
-        # ALL profitable combos go in, no top-N cap - compact_combo_records()
-        # keeps the file size sane by deduping condition names into one shared
-        # dictionary instead of repeating full joined strings per row.
         condition_dictionary, combinations = compact_combo_records(profitable)
 
         return {

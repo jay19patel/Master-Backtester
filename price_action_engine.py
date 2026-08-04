@@ -1,49 +1,10 @@
-"""Price-action engine: swing points, market structure (BOS / CHoCH), breakouts,
-smart-money concepts (order blocks, FVG, liquidity sweeps), fibonacci
-retracement/extension, dynamic trendlines, volatility-contraction patterns,
-and advanced combination signals.
+"""Price-action engine: swing points, market structure (BOS/CHoCH), breakouts,
+smart-money concepts (order blocks, FVG, sweeps), fibonacci, trendlines, and
+range/divergence/combination signals. Every strategy writes one `sig_<name>`
+column (+1 buy, -1 sell, 0 none), firing only once a setup is CONFIRMED -
+swing points are shifted `right` bars after the pivot, so there's no lookahead.
 
-Every strategy writes ONE signal column named `sig_<name>` with values:
-    +1 = BUY signal fired on this candle
-    -1 = SELL signal fired on this candle
-     0 = no signal
-
-Signals fire only on the candle where the setup is CONFIRMED (no lookahead:
-swing points are only used `right` bars after the pivot, i.e. once they are
-actually knowable in real time).
-
-CHANGELOG vs the original version (bug fixes + additions)
------------------------------------------------------------
-Fixes:
-  - `swing_label` silently overwrote HH/LH with HL/LL when a swing high and a
-    swing low were both confirmed on the same bar. Now split into
-    `swing_high_label` / `swing_low_label` (the old combined `swing_label`
-    column is still produced for backward compatibility, but prefer the two
-    new columns if you need both events on the same candle).
-  - Order blocks (`sig_ob_retest`) and fair value gaps (`sig_fvg_fill`) used
-    to track only the single most-recent zone and kept it alive forever
-    (no expiry, no invalidation). They now track up to `max_active_zones`
-    zones each and expire a zone after `max_zone_age` bars or once price
-    closes decisively through it (1 ATR beyond), which is closer to how
-    these zones are actually treated on a real chart.
-  - Documented (not "fixed", it's an inherent tie-break issue) a known edge
-    case: `add_swings` marks a pivot with `High == rolling_max`, so a flat
-    top/bottom (multiple identical highs/lows in one window) can mark more
-    than one bar as a pivot. Rare on real OHLC data with normal tick size,
-    but worth knowing if you feed in coarse/rounded prices.
-
-Additions:
-  - `add_fibonacci_signals`  -> sig_fib_retracement, sig_fib_extension
-  - `add_trendline_signals`  -> sig_trendline_break
-  - `add_range_signals`      -> sig_inside_bar_breakout, sig_nr7_breakout
-
-Usage (everything):
-    df = PriceActionEngine(df).build()
-
-Usage (pick and choose, chainable):
-    engine = PriceActionEngine(df)
-    engine.add_swings().add_market_structure().add_breakout_signals()
-    df = engine.df
+Usage: `df = PriceActionEngine(df).build()`, or chain individual `add_*` methods.
 """
 
 import numpy as np
@@ -55,13 +16,8 @@ class PriceActionEngine:
     """Adds price-action structure columns and discrete trade signals (sig_*)."""
 
     def __init__(self, df, swing_left=3, swing_right=3, max_zone_age=50, max_active_zones=3):
-        """
-        max_zone_age    : how many bars an unfilled order block / FVG zone stays
-                           "live" before it's dropped as stale (SMC zones lose
-                           relevance the older they get).
-        max_active_zones: how many concurrent unfilled zones to track per side
-                           (bull/bear) for order blocks and FVGs.
-        """
+        """max_zone_age: bars before an unfilled OB/FVG zone is dropped as stale.
+        max_active_zones: concurrent zones tracked per side (bull/bear)."""
         self.df = df.copy()
         self.swing_left = swing_left
         self.swing_right = swing_right
@@ -138,22 +94,8 @@ class PriceActionEngine:
     # 1. Swing highs / lows (fractal pivots)
     # ------------------------------------------------------------------
     def add_swings(self):
-        """Fractal swing points: a swing high is a candle whose High is the highest
-        of `left` candles before and `right` candles after it. The pivot only
-        becomes KNOWN `right` candles later, so all derived columns are shifted
-        to the confirmation bar - zero lookahead.
-
-        NOTE: a flat top/bottom (two candles tied for the window's High/Low) can
-        cause more than one bar to satisfy `High == rolling_max` inside the same
-        window and both get marked as pivots. Harmless on typical OHLC data, but
-        worth knowing if your price feed is heavily rounded.
-
-        Adds:
-            swing_high_at_pivot / swing_low_at_pivot : 1 on the pivot bar itself (plot only!)
-            last_swing_high / last_swing_low         : latest CONFIRMED pivot price levels
-            bars_since_swing_high / _low             : freshness of the level
-            sig_swing_break                          : close crosses a confirmed swing level
-        """
+        """Fractal swing points, confirmed `right` bars after the pivot (zero lookahead).
+        NOTE: a flat top/bottom can cause more than one bar to satisfy the pivot condition."""
         df = self.df
         left, right = self.swing_left, self.swing_right
         win = left + right + 1
@@ -161,11 +103,11 @@ class PriceActionEngine:
         is_ph = df["High"] == df["High"].rolling(win, center=True, min_periods=win).max()
         is_pl = df["Low"] == df["Low"].rolling(win, center=True, min_periods=win).min()
 
-        # Marked on the pivot bar itself - only for plotting, never for signals.
+        # pivot bar itself - plotting only, never used for signals
         df["swing_high_at_pivot"] = is_ph.astype(int)
         df["swing_low_at_pivot"] = is_pl.astype(int)
 
-        # Price of the pivot, placed on the bar where it becomes CONFIRMED.
+        # placed on the bar where the pivot becomes CONFIRMED
         confirmed_high = df["High"].where(is_ph).shift(right)
         confirmed_low = df["Low"].where(is_pl).shift(right)
         df["last_swing_high"] = confirmed_high.ffill()
@@ -174,12 +116,12 @@ class PriceActionEngine:
         df["bars_since_swing_high"] = df.groupby(confirmed_high.notna().cumsum()).cumcount()
         df["bars_since_swing_low"] = df.groupby(confirmed_low.notna().cumsum()).cumcount()
 
-        # Simple swing-level break (raw version of BOS, no trend state).
+        # raw swing-level break, no trend state (see BOS below)
         cross_up = (df["Close"] > df["last_swing_high"]) & (df["Close"].shift(1) <= df["last_swing_high"].shift(1))
         cross_dn = (df["Close"] < df["last_swing_low"]) & (df["Close"].shift(1) >= df["last_swing_low"].shift(1))
         df["sig_swing_break"] = np.where(cross_up, 1, np.where(cross_dn, -1, 0))
 
-        # Keep the confirmed pivot event series for the structure walker below.
+        # used by add_market_structure below
         self._confirmed_high = confirmed_high
         self._confirmed_low = confirmed_low
         return self
@@ -188,26 +130,9 @@ class PriceActionEngine:
     # 2. Market structure: BOS / CHoCH + HH/HL/LH/LL
     # ------------------------------------------------------------------
     def add_market_structure(self):
-        """Walks the chart bar by bar keeping the classic structure state machine:
-
-        - BOS  (Break of Structure)  : close breaks the last swing level IN the
-          direction of the current trend -> trend continuation.
-        - CHoCH (Change of Character): close breaks the last swing level AGAINST
-          the current trend -> possible reversal, trend state flips.
-        - Each confirmed swing is labelled HH / HL / LH / LL vs the previous
-          swing of the same type.
-
-        Adds:
-            structure_trend  : +1 bullish / -1 bearish structure right now
-            sig_bos          : +1/-1 on the exact break candle (continuation break)
-            sig_choch        : +1/-1 on the exact break candle (reversal break)
-            swing_high_label : 2=HH, -1=LH on the confirmation bar of a swing high
-            swing_low_label  : 1=HL, -2=LL on the confirmation bar of a swing low
-            swing_label      : combined column kept for backward compatibility
-                                (if a high AND a low confirm on the same bar, the
-                                low label wins here - use the two columns above
-                                if you need both)
-        """
+        """BOS = break of the last swing level in the trend direction (continuation).
+        CHoCH = break against the current trend (reversal, trend flips).
+        swing_label combines high/low labels; if both confirm same bar, low label wins."""
         if "last_swing_high" not in self.df.columns:
             self.add_swings()
         df = self.df
@@ -233,7 +158,7 @@ class PriceActionEngine:
 
             if broke_up:
                 if trend == -1:
-                    choch[i] = 1  # bearish structure broken upward -> character change
+                    choch[i] = 1  # bearish structure broken upward = CHoCH
                 else:
                     bos[i] = 1
                 trend = 1
@@ -252,8 +177,7 @@ class PriceActionEngine:
         df["sig_bos"] = bos
         df["sig_choch"] = choch
 
-        # HH / HL / LH / LL labels on confirmation bars (kept in separate arrays
-        # so a high and a low confirming on the same bar don't clobber each other).
+        # separate arrays so a same-bar high+low don't clobber each other
         label_high = np.zeros(n)
         label_low = np.zeros(n)
         ch = self._confirmed_high.to_numpy()
@@ -278,12 +202,8 @@ class PriceActionEngine:
     # 3. Candlestick reversal signals
     # ------------------------------------------------------------------
     def add_candlestick_signals(self):
-        """Engulfing and pin-bar (rejection candle) signals.
-
-        Bullish engulfing : green candle whose body swallows the previous red body.
-        Pin bar           : wick >= 2x body on one side + close near the other
-                            extreme = strong rejection of that price.
-        """
+        """Engulfing: body swallows the previous opposite-colour body.
+        Pin bar: wick >= 2x body on one side + close near the other extreme (rejection)."""
         df = self.df
         body = (df["Close"] - df["Open"]).abs()
         prev_bear = df["Close"].shift(1) < df["Open"].shift(1)
@@ -317,15 +237,9 @@ class PriceActionEngine:
     # 4. Breakout signals
     # ------------------------------------------------------------------
     def add_breakout_signals(self):
-        """Three classic breakout styles:
-
-        sig_donchian         : close breaks the 20-bar high/low (turtle breakout).
-        sig_sr_breakout      : close breaks the strongest recent S/R level
-                               (max of last 3 swing highs / min of last 3 swing lows).
-        sig_squeeze_breakout : TTM squeeze - Bollinger Bands go INSIDE Keltner
-                               Channel (volatility compression), then the first
-                               expansion candle picks the direction, volume-confirmed.
-        """
+        """sig_donchian: 20-bar high/low break (turtle). sig_sr_breakout: break of the
+        strongest of the last 3 swing pivots. sig_squeeze_breakout: TTM squeeze
+        (BB inside KC) release, direction confirmed by volume."""
         if "last_swing_high" not in self.df.columns:
             self.add_swings()
         df = self.df
@@ -364,27 +278,11 @@ class PriceActionEngine:
     # 5. Smart money concepts: order blocks, FVG, liquidity sweeps
     # ------------------------------------------------------------------
     def add_smart_money_signals(self):
-        """SMC/ICT-style concepts:
-
-        Order block (OB): the last opposite-colour candle before an impulsive move
-        (move > 1.5 ATR within 3 candles). Institutions supposedly left unfilled
-        orders there, so price often reacts when it returns to that zone. Up to
-        `max_active_zones` bull and bear zones are tracked at once; a zone is
-        dropped once it's older than `max_zone_age` bars or once price closes
-        more than 1 ATR through it without reacting (decisively invalidated).
-            sig_ob_retest : price re-enters a live OB zone and closes back out
-                            in the OB direction.
-
-        Fair value gap (FVG): 3-candle imbalance - candle1.High < candle3.Low
-        (bullish gap). Price tends to come back and "fill" the gap. Same
-        multi-zone + expiry/invalidation handling as order blocks.
-            sig_fvg_fill  : price dips into a live FVG and closes back beyond it
-                            in the gap direction.
-
-        Liquidity sweep / stop hunt: wick takes out the last swing level but the
-        candle CLOSES back inside = stops harvested, real move often opposite.
-            sig_sweep     : sweep candle itself (close back inside the level).
-        """
+        """Order block: last opposite candle before an impulse (>1.5 ATR/3 candles);
+        tracks up to max_active_zones per side, expires after max_zone_age bars or
+        a 1-ATR close-through invalidation. FVG: 3-candle gap (candle1.High <
+        candle3.Low = bullish), same multi-zone/expiry handling. Liquidity sweep:
+        wick takes the swing level but candle closes back inside (stop hunt)."""
         if "last_swing_high" not in self.df.columns:
             self.add_swings()
         df = self.df
@@ -488,15 +386,10 @@ class PriceActionEngine:
     # 6. Pullback / retracement entries
     # ------------------------------------------------------------------
     def add_pullback_signals(self):
-        """Trend-following entries on a dip instead of a chase:
-
-        sig_ema_pullback   : EMA20 > EMA50 uptrend, price dips and TOUCHES EMA20,
-                             closes back above it with RSI still healthy (>45).
-        sig_golden_pullback: last impulse (swing low -> swing high) retraces into
-                             the 50%-61.8% fib "golden zone", bullish close there.
-        sig_vwap_reclaim   : close crosses back above VWAP with a volume surge
-                             while structure is bullish (mirror for shorts).
-        """
+        """sig_ema_pullback: dip touches EMA20 in an EMA20>EMA50 uptrend, closes back
+        above with RSI still healthy. sig_golden_pullback: retrace into the fib
+        50-61.8% "golden zone" of the last impulse. sig_vwap_reclaim: VWAP cross
+        back with a volume surge, structure-aligned."""
         if "structure_trend" not in self.df.columns:
             self.add_market_structure()
         df = self.df
@@ -544,23 +437,10 @@ class PriceActionEngine:
     # 7. Fibonacci retracement + extension (NEW)
     # ------------------------------------------------------------------
     def add_fibonacci_signals(self):
-        """Fibonacci retracement (reaction) and extension (exhaustion) signals,
-        anchored to the last confirmed swing impulse (last_swing_low <->
-        last_swing_high).
-
-        sig_fib_retracement : price pulls back into the 38.2%-78.6% zone of the
-                               last impulse, in the direction of structure_trend,
-                               and prints a rejection candle - continuation entry.
-                               (Note: this overlaps with `sig_golden_pullback`,
-                               which only checks the narrower 50%-61.8% band -
-                               use whichever zone width fits your style, or both
-                               together for a stronger confluence read.)
-        sig_fib_extension   : price pushes beyond the 127.2%-161.8% extension of
-                               the last impulse and prints a rejection candle -
-                               treated here as an exhaustion / take-profit signal
-                               (contrarian to the prevailing move, not a fresh
-                               continuation entry).
-        """
+        """sig_fib_retracement: pullback into the 38.2-78.6% zone of the last impulse,
+        with structure_trend, continuation entry (overlaps sig_golden_pullback's
+        narrower 50-61.8% band). sig_fib_extension: push beyond the 127.2-161.8%
+        extension, contrarian exhaustion/take-profit signal."""
         if "structure_trend" not in self.df.columns:
             self.add_market_structure()
         df = self.df
@@ -604,22 +484,9 @@ class PriceActionEngine:
     # 8. Dynamic trendline breaks (NEW)
     # ------------------------------------------------------------------
     def add_trendline_signals(self, lookback_pivots=3):
-        """Fits a least-squares line through the last `lookback_pivots` confirmed
-        swing highs (a descending resistance trendline) and through the last
-        `lookback_pivots` confirmed swing lows (an ascending support trendline),
-        projects each line to the current bar, and fires when price closes
-        through the projection.
-
-        sig_trendline_break : +1 = close breaks above a descending resistance
-                               trendline, -1 = close breaks below an ascending
-                               support trendline.
-
-        Performance note: this refits a line every bar once >=2 pivots exist.
-        With a small `lookback_pivots` (default 3) it's cheap, but on very long
-        intraday histories (100k+ bars) this loop is the slowest part of the
-        whole pipeline - vectorizing it is possible but meaningfully more
-        complex, so it's left as a plain loop for readability.
-        """
+        """Fits a least-squares trendline through the last `lookback_pivots` swing
+        highs/lows, fires when close crosses the projected line.
+        Note: refits every bar - the slowest step of the pipeline on 100k+ bar histories."""
         if "last_swing_high" not in self.df.columns:
             self.add_swings()
         df = self.df
@@ -664,17 +531,8 @@ class PriceActionEngine:
     # 9. Volatility-contraction range patterns (NEW)
     # ------------------------------------------------------------------
     def add_range_signals(self):
-        """Contraction-then-expansion breakout patterns:
-
-        sig_inside_bar_breakout : an inside bar (High/Low fully inside the prior
-                                   candle's range) followed by a break of the
-                                   inside bar's high/low - classic contraction
-                                   breakout entry.
-        sig_nr7_breakout        : today's range is the narrowest of the last 7
-                                   candles (NR7); a break of that narrow-range
-                                   candle's high/low on the next candle signals
-                                   the start of an expansion move.
-        """
+        """sig_inside_bar_breakout: break of an inside bar's high/low.
+        sig_nr7_breakout: break of the narrowest-range-of-7 (NR7) candle's high/low."""
         df = self.df
         rng = df["High"] - df["Low"]
 
@@ -693,14 +551,8 @@ class PriceActionEngine:
     # 10. RSI divergence at swing points
     # ------------------------------------------------------------------
     def add_divergence_signals(self):
-        """Classic divergence, measured only at CONFIRMED swing points:
-
-        Bullish : price prints a LOWER low (new swing low < previous swing low)
-                  but RSI at those two pivots prints a HIGHER low -> momentum
-                  no longer confirms the fall.
-        Bearish : mirror at swing highs.
-        Signal fires on the confirmation bar of the second pivot.
-        """
+        """Divergence at confirmed swing points: price makes a lower low (or higher
+        high) while RSI makes the opposite - momentum no longer confirms price."""
         if "last_swing_high" not in self.df.columns:
             self.add_swings()
         df = self.df
@@ -744,22 +596,11 @@ class PriceActionEngine:
     # 11. Advanced combination signals (confluence maths)
     # ------------------------------------------------------------------
     def add_combination_signals(self):
-        """Multi-factor confluence - each factor votes +1/-1, the score is the sum:
-
-            trend_score = EMA stack + supertrend + MACD histogram sign
-                        + ADX directional bias + price vs VWAP        (range -5..+5)
-
-        sig_trend_confluence : fires only when the score CROSSES the +-4 threshold
-                               (fresh alignment of >=4 of 5 factors, not every bar).
-        sig_bos_retest       : after a bullish BOS, price returns to the broken
-                               level (within 0.25 ATR) and bounces off it - the
-                               classic "break and retest" entry.
-        sig_sweep_reversal   : liquidity sweep + reversal-candle confirmation
-                               (engulfing or pin bar on the same/next candle).
-        sig_super_confluence : structure trend + confluence score + volume
-                               all agree on a fresh CHoCH/BOS candle - the
-                               strictest (and rarest) signal in the file.
-        """
+        """trend_score sums EMA stack + supertrend + MACD sign + ADX-filtered DI bias
+        + VWAP side (range -5..+5). sig_trend_confluence fires only when the score
+        CROSSES +-4 (fresh alignment, not every bar). sig_bos_retest: break-and-retest
+        within 0.25 ATR. sig_sweep_reversal: sweep + reversal candle. sig_super_confluence:
+        structure + score + volume all agree on a fresh break (strictest, rarest)."""
         needed = ["structure_trend", "sig_sweep", "sig_engulfing"]
         if any(col not in self.df.columns for col in needed):
             self.add_market_structure()

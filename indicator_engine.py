@@ -7,11 +7,7 @@ from scipy import stats
 
 
 class IndicatorEngine:
-    """Builds a full technical-indicator / feature set on top of raw OHLCV data.
-
-    Usage:
-        df = IndicatorEngine(raw_df).build()
-    """
+    """Builds the full technical-indicator/feature set on top of raw OHLCV data."""
 
     def __init__(self, df):
         self.df = df.copy()
@@ -55,18 +51,14 @@ class IndicatorEngine:
         df["return_20"] = df["Close"].pct_change(20)
 
         df["open_close_return"] = np.log(df["Close"] / df["Open"])
-        # high_open_return dropped: unused by every strategy the combo search has
-        # ever found useful, and redundant with open_close_return/low_open_return
-        # (same corner-return family).
+        # high_open_return dropped: unused in practice, redundant with open/low_open_return
         df["low_open_return"] = np.log(df["Low"] / df["Open"])
 
         df["log_volume"] = np.log(df["Volume"] + 1)
         df["volume_ratio"] = df["Volume"] / df["Volume"].rolling(20).mean()
-        # volume_std dropped: never a useful condition on its own, no downstream dependency.
+        # volume_std dropped: never useful, no downstream dependency
 
-        # daily_range and range_pct dropped: 99.5% correlated with each other
-        # (High-Low over Close vs over Open - barely differs) and neither was
-        # ever a useful condition in the combo search.
+        # daily_range/range_pct dropped: 99.5% correlated with each other, never useful
 
     # ------------------------------------------------------------------
     # Moving averages & trend
@@ -74,13 +66,11 @@ class IndicatorEngine:
     def _add_moving_averages(self):
         df = self.df
 
-        # EMA_5 dropped: 0.93-correlated with EMA_10 as a >median condition
-        # (near-duplicate search result) and never itself a useful condition.
+        # EMA_5 dropped: 0.93-correlated with EMA_10, near-duplicate, never useful
         for period in [10, 20, 50, 100]:
             df[f"EMA_{period}"] = ta.ema(df["Close"], length=period).bfill()
 
-        # SMA_200 dropped: never a useful condition; SMA_50 kept only as the
-        # price_to_sma_50 dependency (SMA_20/100 are used directly).
+        # SMA_200 dropped: never useful; SMA_50 kept only as price_to_sma_50 dependency
         for period in [20, 50, 100]:
             df[f"SMA_{period}"] = ta.sma(df["Close"], length=period).bfill()
 
@@ -98,9 +88,7 @@ class IndicatorEngine:
     def _add_momentum_indicators(self):
         df = self.df
 
-        # RSI_14 dropped: 0.76-0.87 correlated with RSI_7/RSI_21 as a >median
-        # condition (near-duplicate) and never itself a useful condition -
-        # RSI_7 and RSI_21 already cover the short/long ends of this family.
+        # RSI_14 dropped: correlated with RSI_7/RSI_21, never itself useful
         for period in [7, 21]:
             df[f"RSI_{period}"] = ta.rsi(df["Close"], length=period).bfill()
 
@@ -122,9 +110,7 @@ class IndicatorEngine:
     def _add_volatility_indicators(self):
         df = self.df
 
-        # ATR_7 dropped: 0.81-correlated with ATR_14 as a >median condition
-        # and never itself a useful condition; ATR_14 stays as a dependency
-        # for ATR_pct/stop_hunt_proxy, ATR_21 stays as its own condition.
+        # ATR_7 dropped: correlated with ATR_14, never useful; ATR_14 kept as a dependency
         for period in [14, 21]:
             df[f"ATR_{period}"] = ta.atr(df["High"], df["Low"], df["Close"], length=period).bfill()
 
@@ -144,9 +130,7 @@ class IndicatorEngine:
             df["KC_upper"] = kc.iloc[:, 2].bfill()
 
         df["volatility_10"] = df["Close"].pct_change().rolling(10).std()
-        # volatility_20/volatility_50 dropped: never used as a standalone
-        # condition or dependency; volatility_10 alone drives vol_regime,
-        # fractal_proxy, and shock_elasticity.
+        # volatility_20/50 dropped: unused; volatility_10 alone drives downstream features
 
     # ------------------------------------------------------------------
     # Trend strength
@@ -180,8 +164,7 @@ class IndicatorEngine:
     def _add_volume_indicators(self):
         df = self.df
 
-        # OBV/OBV_ema dropped: 0.80 condition-agreement with each other, and
-        # neither was ever a useful condition. AD dropped: never used.
+        # OBV/OBV_ema/AD dropped: redundant with each other, never useful
         df["CMF"] = ta.cmf(df["High"], df["Low"], df["Close"], df["Volume"], length=20).bfill()
         df["MFI"] = ta.mfi(df["High"], df["Low"], df["Close"], df["Volume"], length=14).bfill()
         df["VPT"] = ta.pvt(df["Close"], df["Volume"]).bfill()
@@ -215,8 +198,7 @@ class IndicatorEngine:
     def _add_statistical_features(self):
         df = self.df
 
-        # zscore_20 dropped: moderately correlated with kept zscore_10/zscore_50
-        # and never itself a useful condition.
+        # zscore_20 dropped: correlated with zscore_10/50, never useful
         for period in [10, 50]:
             df[f"zscore_{period}"] = (df["Close"] - df["Close"].rolling(period).mean()) / (
                 df["Close"].rolling(period).std() + 0.0001
@@ -224,9 +206,7 @@ class IndicatorEngine:
 
         df["skew_20"] = df["return_1"].rolling(20).skew()
         df["kurt_20"] = df["return_1"].rolling(20).kurt()
-        # percentile_rank_20 dropped: never a useful condition, and it was the
-        # single slowest computation in the whole engine (scipy percentileofscore
-        # inside a rolling(20).apply()).
+        # percentile_rank_20 dropped: never useful, and was the slowest computation in the engine
 
     # ------------------------------------------------------------------
     # Advanced volatility microstructure
@@ -238,8 +218,7 @@ class IndicatorEngine:
         new_features["realized_var_20"] = (df["return_1"] ** 2).rolling(20).sum()
         new_features["bipower_var"] = (abs(df["return_1"]) * abs(df["return_1"].shift())).rolling(20).sum()
         new_features["jump_strength"] = new_features["realized_var_20"] - new_features["bipower_var"]
-        # vol_cluster, range_compression, vol_reversion_speed dropped: none was
-        # ever a useful condition and none has a downstream dependency.
+        # vol_cluster/range_compression/vol_reversion_speed dropped: never useful, no dependents
         new_features["vol_regime"] = (df["volatility_10"] > df["volatility_10"].rolling(50).mean()).astype(int)
         rng = df["High"] - df["Low"]
         new_features["range_velocity"] = (rng - rng.shift(1)) / (rng.shift(1) + 0.0001)
@@ -295,8 +274,7 @@ class IndicatorEngine:
         df = self.df
         new_features = pd.DataFrame(index=df.index)
 
-        # buy_pressure dropped: row-for-row identical formula to close_position
-        # (Close-Low)/(High-Low), already added in _add_candle_features.
+        # buy_pressure dropped: identical formula to close_position
         new_features["slippage_proxy"] = (df["High"] - df["Low"]) / df["Close"].rolling(10).mean()
         new_features["stop_hunt_proxy"] = (df["High"] - df["Low"]) / (df["ATR_14"] + 0.0001)
         # amihud_illiquidity dropped: never a useful condition.
@@ -310,8 +288,7 @@ class IndicatorEngine:
         df = self.df
         new_features = pd.DataFrame(index=df.index)
 
-        # rsi_vol, rsi_atr, bb_rsi dropped: all depended on RSI_14/BB_position,
-        # both already cut above, and none was ever a useful condition itself.
+        # rsi_vol/rsi_atr/bb_rsi dropped: depended on already-cut RSI_14/BB_position
         new_features["trend_volume"] = df["trend_strength"] * df["volume_ratio"]
         new_features["adx_volume"] = df["ADX_14"] * df["volume_ratio"]
         new_features["vol_atr_ratio"] = df["volume_ratio"] / (df["ATR_pct"] + 0.0001)

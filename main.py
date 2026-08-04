@@ -23,10 +23,7 @@ INTERVAL = "15m"
 TOTAL_DAYS = 600
 
 INCLUDE_INDICATORS = True
-# Largest rolling window IndicatorEngine uses is 100 bars (EMA_100/SMA_100) -
-# pandas_ta returns None instead of a column when there isn't enough history,
-# which crashes with a confusing AttributeError deep inside IndicatorEngine.
-# This catches it early with an actionable message instead.
+# Largest indicator window is 100 bars (EMA_100/SMA_100); need more history than that.
 MIN_INDICATOR_BARS = 150
 
 BACKTEST_INITIAL_CAPITAL = 1000.0
@@ -38,24 +35,15 @@ BACKTEST_FEE_PCT = 0.05
 
 RUN_COMBO_BACKTEST = True
 COMBO_MIN_SIZE = 3
-# Safety ceiling, not a target - the search (see ComboBacktester) tries every
-# size (1, 1+2, 1+2+3, ...) and stops on its own once no combo of the next
-# size clears COMBO_MIN_FIRES, OR once COMBO_MAX_SEARCH_SECONDS runs out
-# (whichever comes first). This just bounds how far it's ALLOWED to go.
-COMBO_MAX_SIZE = 10
+# Ceiling on combo size - search stops early on its own once nothing clears COMBO_MIN_FIRES.
+COMBO_MAX_SIZE = 100
 COMBO_MIN_FIRES = 15
 COMBO_CONSOLE_TOP_N = 20
-COMBO_N_WORKERS = None  # None = every CPU core minus one (keeps the machine responsive)
-# Three safety nets that make the search stop CLEANLY (never randomly sample
-# or hang) once a level/run gets too big - see ComboBacktester's module
-# docstring. COMBO_MAX_SEARCH_SECONDS is the one that actually GUARANTEES a
-# bounded run regardless of dataset/pool size - raise it for a longer, deeper
-# search; lower it for a quicker one. Combos already found when a limit trips
-# are always kept - nothing found gets thrown away, the search just stops
-# looking for more. report.json/console always say exactly where and why.
+COMBO_N_WORKERS = None  # None = every CPU core minus one
 COMBO_MAX_RAW_CANDIDATES_PER_LEVEL = 20_000_000
-COMBO_MAX_SURVIVORS_PER_LEVEL = 20_000
-COMBO_MAX_SEARCH_SECONDS = 120  # per direction (long/short each get this much)
+# How many combos carry forward into the next size, per stage (size 1 always keeps all).
+COMBO_MAX_SURVIVORS_PER_LEVEL = 100000
+COMBO_MAX_SEARCH_SECONDS = None  # None = no wall-clock limit
 
 RUN_JSON_EXPORT = True
 JSON_EXPORT_PATH = "report.json"
@@ -118,9 +106,7 @@ def main():
     df = build_dataset()
     print_report(df)
 
-    # Computed once here and handed to ReportExporter so the JSON export
-    # doesn't re-run the (expensive) combo search a second time just to save it.
-    precomputed = {}
+    precomputed = {}  # avoids re-running the combo search just to export it
 
     if RUN_COMBO_BACKTEST:
         combo_bt = ComboBacktester(

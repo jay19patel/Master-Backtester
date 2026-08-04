@@ -1,21 +1,16 @@
-"""finalbacktesting.py: finds the top Long combos and top Short combos (by
-total PnL) from ComboBacktester's search, and exports everything
-dashboard.html's "Final Backtest" tab needs to let you pick ANY one of each
-side and see a COMBINED, single-account backtest - when the Long strategy's
-signal fires, it takes a long trade; when the Short strategy's signal fires,
-it takes a short trade; both on the same equity curve, not two separate
-reports. The actual bar-by-bar simulation for whatever pair you pick runs
-client-side in dashboard.html's JS (a straight port of backtester.py's
-simulate_trades), so switching strategies is instant - no need to re-run this
-script for every combination, only when you want the underlying combo search
-refreshed.
+"""finalbacktesting.py: finds the top Long and Short combos (by total PnL)
+from ComboBacktester's search, and exports what dashboard.html's "Final
+Backtest" tab needs to combine any one of each side into a single combined
+equity curve. Simulation for the picked pair runs client-side in JS (a port
+of backtester.py's simulate_trades) - this script only needs re-running when
+the underlying combo search should be refreshed.
 
 Usage:
     python3 finalbacktesting.py
 
 Output:
-    final_backtest_data.json - OHLC candles + params + the top Long/Short
-    combos (each with its own boolean signal mask) for dashboard.html to load.
+    final_backtest_data.json - OHLC + params + top Long/Short combos (each
+    with its boolean signal mask) for dashboard.html to load.
 """
 
 import json

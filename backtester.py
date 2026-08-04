@@ -1,31 +1,12 @@
 """Backtester: simulates trading each PriceActionEngine sig_* signal on its own,
-starting from a fixed account balance, so you can see which signals would have
-actually grown (or shrunk) real money - not just an abstract hit-rate number.
+from a fixed account balance, to see real PnL - not just a hit-rate number.
 
-What makes this "realistic" instead of a naive lookahead-free hit-rate check:
+Realistic by construction: entry at next candle's Open (no lookahead), a
+fixed-% stop/target bracket walked bar-by-bar (time exit at max_hold_bars if
+neither is hit), risk-based position sizing (% of current equity), a
+round-trip fee, and no overlapping trades per signal.
 
-  - Entry is at the NEXT candle's Open, never the signal candle's own Close -
-    you can only act once a candle has actually finished.
-  - Every trade carries a fixed-% stop-loss AND take-profit off the entry price
-    (default 0.5% stop / 1% target - a 1:2 reward:risk bracket). Whichever
-    level price touches first, walking the candles bar by bar, decides the
-    exit. If neither is touched within `max_hold_bars`, the trade is closed at
-    that bar's Close (a time exit - closer to how a real strategy would give
-    up on a stale setup).
-  - Position size is risk-based: each trade risks a fixed `risk_per_trade_pct`
-    of CURRENT equity (not the original $100), sized so that hitting the stop
-    loses exactly that %. This is the standard way real strategies size
-    positions - it also means the account can't blow up in one bad trade, and
-    equity compounds realistically as it grows or shrinks.
-  - A round-trip fee/slippage cost (`fee_pct`) is deducted from every trade.
-  - Trades for the same signal never overlap - a new signal is ignored while a
-    position from that same signal is still open, exactly like a single
-    strategy running on a single account.
-
-Reward:risk math worth knowing: with the default stop_loss_pct=0.5 and
-take_profit_pct=1.0 (a 1:2 risk:reward bracket), the breakeven win rate before
-fees is 1 / (1 + reward/risk) = 33.3%. Anything reliably above that, after
-fees, is a real edge; anything at or below it is not.
+Breakeven win rate before fees = 1 / (1 + reward/risk).
 """
 
 import numpy as np
@@ -41,12 +22,9 @@ def simulate_trades(
     initial_capital, risk_per_trade_pct, stop_loss_pct, take_profit_pct, max_hold_bars, fee_pct,
     index=None,
 ):
-    """Core bar-by-bar bracket simulation (entry at next open, stop/target walked
-    bar by bar, risk-based sizing, fees, no overlapping trades). Shared by
-    Backtester (single signals, full trade detail incl. timestamps) and
-    ComboBacktester's parallel workers (index=None skips entry_time/exit_time,
-    which combo scoring never reads - keeps the per-task payload numpy-only, no
-    DataFrame needed in the worker process)."""
+    """Core bar-by-bar bracket simulation. Shared by Backtester (full trade
+    detail incl. timestamps) and ComboBacktester's workers (index=None skips
+    entry_time/exit_time, keeping the payload numpy-only)."""
     n = len(open_)
     equity = initial_capital
     trades = []
@@ -82,9 +60,7 @@ def simulate_trades(
                 hit_stop = high[j] >= stop_price
                 hit_target = low[j] <= target_price
 
-            # If a single candle's range could have hit both, assume the
-            # worse outcome (stop) happened first - the conservative,
-            # realistic default when you don't know the exact intra-candle path.
+            # If both stop and target were touched in one candle, assume stop hit first.
             if hit_stop:
                 exit_price, exit_reason, exit_i = stop_price, "stop", j
                 break
@@ -143,13 +119,11 @@ class Backtester:
     ):
         """
         initial_capital    : starting account balance ($)
-        risk_per_trade_pct : % of CURRENT equity risked per trade (position size
-                              is sized so hitting the stop loses exactly this much)
-        stop_loss_pct       : stop-loss distance from entry, as a % of entry price
-        take_profit_pct     : take-profit distance from entry, as a % of entry price
-        max_hold_bars       : force-close the trade after this many candles if
-                               neither the stop nor the target was touched
-        fee_pct             : round-trip fee/slippage, % of trade notional
+        risk_per_trade_pct : % of current equity risked per trade
+        stop_loss_pct      : stop-loss distance from entry, % of entry price
+        take_profit_pct    : take-profit distance from entry, % of entry price
+        max_hold_bars      : force-close after this many candles if neither hit
+        fee_pct            : round-trip fee/slippage, % of trade notional
         """
         has_signals = any(c.startswith("sig_") for c in df.columns)
         self.df = df.copy() if has_signals else PriceActionEngine(df.copy()).build()
@@ -168,10 +142,8 @@ class Backtester:
 
     @property
     def fee_adjusted_breakeven_win_rate_pct(self):
-        """Fees are a fixed cost per trade (win or lose), so they don't just shave
-        a little off the edge - they raise the win rate you actually need to clear.
-        fee_pct_of_risk comes from leverage: a tight stop means a big notional for
-        a small $ risk, and the fee is charged on that notional."""
+        """Fees raise the win rate needed to break even - a tight stop implies
+        leverage, so the fee (charged on notional) bites harder per $ risked."""
         reward_risk = self.take_profit_pct / self.stop_loss_pct
         _, fee_pct_of_risk = self._fee_drag_stats()
         return (1 + fee_pct_of_risk / 100) / (1 + reward_risk) * 100
@@ -183,11 +155,8 @@ class Backtester:
         return self.simulate_direction_array(self.df[col].to_numpy())
 
     def simulate_direction_array(self, sig):
-        """Same trade simulation as _simulate_signal, but takes a raw +1/-1/0
-        direction array directly instead of a column name - lets other modules
-        (e.g. a combined/confluence signal built from several sig_* columns)
-        reuse this exact, already-validated simulation without needing to
-        write it to a real column on the DataFrame first."""
+        """Same as _simulate_signal but takes a raw +1/-1/0 array directly,
+        so a combined/confluence signal can reuse it without a real column."""
         df = self.df
         return simulate_trades(
             sig,
@@ -254,10 +223,8 @@ class Backtester:
         return result
 
     def _fee_drag_stats(self):
-        """How much of each trade's risked $ gets eaten by fees, given the tight
-        stop implies leverage - the risked amount is fixed (risk_per_trade_pct of
-        equity) but the FEE is charged on notional, and notional = risk / stop%,
-        so a tighter stop means more leverage and a bigger fee bite per $ risked."""
+        """How much of each trade's risked $ gets eaten by fees - notional =
+        risk / stop%, so a tighter stop means more leverage and bigger fee drag."""
         stop_pct = self.stop_loss_pct
         implied_leverage = self.risk_per_trade_pct / stop_pct if stop_pct else float("nan")
         fee_pct_of_risk = (self.fee_pct * 2) / stop_pct * 100 if stop_pct else float("nan")
@@ -347,6 +314,4 @@ class Backtester:
                 f"${best['final_equity']:.2f} ({best['return_pct']:+.1f}%) over {best['trades']} trades, "
                 f"{best['win_rate_pct']:.1f}% win rate."
             )
-        return result
-
         return result
