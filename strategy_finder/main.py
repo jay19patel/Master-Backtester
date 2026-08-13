@@ -11,11 +11,11 @@ import pandas as pd
 from rich.console import Console
 from rich.table import Table
 
-from combo_backtester import ComboBacktester
-from data_fetcher import DataFetcher
-from indicator_engine import IndicatorEngine
-from price_action_engine import PriceActionEngine
-from report_exporter import ReportExporter
+from .combo_backtester import ComboBacktester
+from .data_fetcher import DataFetcher
+from .indicator_engine import IndicatorEngine
+from .price_action_engine import PriceActionEngine
+from .report_exporter import ReportExporter
 
 pd.set_option("display.max_columns", None)
 pd.set_option("display.width", 200)
@@ -52,7 +52,7 @@ COMBO_MAX_SURVIVORS_PER_LEVEL = 100000
 COMBO_MAX_SEARCH_SECONDS = None  # None = no wall-clock limit
 
 RUN_JSON_EXPORT = True
-JSON_EXPORT_PATH = "report.json"
+JSON_EXPORT_PATH = "data/report.json"
 
 OHLCV_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 
@@ -147,8 +147,8 @@ def main():
 
 def print_run_summary(run_start, df, precomputed, output_paths):
     """Short end-of-run summary: total time, row/column counts, where the
-    output landed. The detailed combo breakdown lives in report.json / the
-    ui.py dashboard, not the console."""
+    output landed. The detailed combo breakdown lives in data/report.json /
+    the ui/ Streamlit app, not the console."""
     console = Console(width=220)
     elapsed = time.monotonic() - run_start
 
@@ -165,7 +165,7 @@ def print_run_summary(run_start, df, precomputed, output_paths):
             size_mb = os.path.getsize(path) / (1024 * 1024)
             console.print(f"Saved               : {path} ({size_mb:.1f} MB)")
 
-    console.print("View results        : run `python3 ui.py` and open http://127.0.0.1:5000")
+    console.print("View results        : run `streamlit run ui/app.py`")
 
 
 def export_config():

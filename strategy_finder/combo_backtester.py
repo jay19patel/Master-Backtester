@@ -43,9 +43,8 @@ import numpy as np
 import pandas as pd
 from rich.console import Console
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
-from rich.table import Table
 
-from backtester import simulate_trades
+from .backtester import simulate_trades
 
 OHLCV_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 
@@ -577,8 +576,8 @@ class ComboBacktester:
             console.print("None were profitable under these realistic assumptions.")
             return profitable
 
-        # Full breakdown (top combos, best-per-size, top win rate) lives in report.json / the
-        # ui.py dashboard now - keeping the console output to a short summary here.
+        # Full breakdown (top combos, best-per-size, top win rate, indicator diagnostics)
+        # lives in data/report.json / the ui/ Streamlit app - console stays a short summary.
         best = profitable.iloc[0]
         console.print(
             f"\n[bold]Best combo overall:[/bold] [{best['direction']}] {best['combo']} (size {best['size']}) -> "
@@ -586,39 +585,3 @@ class ComboBacktester:
             f"over {best['trades']} trades, {best['win_rate_pct']:.1f}% win rate."
         )
         return profitable
-
-    @staticmethod
-    def _make_table(title, rows_df, numbered=True, size_col=True):
-        table = Table(title=title, show_lines=False)
-        if numbered:
-            table.add_column("#", justify="right", style="dim")
-        if size_col:
-            table.add_column("size", justify="right", style="dim")
-        table.add_column("Dir", style="bold")
-        table.add_column("Combo", style="bold")
-        table.add_column("fires", justify="right")
-        table.add_column("trades", justify="right")
-        table.add_column("win_rate%", justify="right")
-        table.add_column("final_$", justify="right")
-        table.add_column("total_pnl", justify="right")
-        table.add_column("return%", justify="right")
-
-        for i, row in rows_df.iterrows():
-            dir_style = "green" if row["direction"] == "Long" else "red"
-            cells = []
-            if numbered:
-                cells.append(str(i + 1))
-            if size_col:
-                cells.append(str(row["size"]))
-            cells.extend([
-                f"[{dir_style}]{row['direction']}[/{dir_style}]",
-                row["combo"],
-                str(row["fires"]),
-                str(row["trades"]),
-                f"{row['win_rate_pct']:.1f}",
-                f"{row['final_equity']:.2f}",
-                f"[green]{row['total_pnl']:+.2f}[/green]",
-                f"[green]{row['return_pct']:+.1f}[/green]",
-            ])
-            table.add_row(*cells)
-        return table

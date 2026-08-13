@@ -198,8 +198,6 @@ class IndicatorEngine:
         df["is_wide_range_candle"] = (rng > 1.5 * df["ATR_14"]).astype(int)
         df["is_narrow_range_candle"] = (rng == rng.rolling(7).min()).astype(int)
 
-        # gap_up dropped: rare + negative lift in combo search
-        # df["gap_up"] = (df["Open"] > df["Close"].shift(1)).astype(int)
         df["gap_down"] = (df["Open"] < df["Close"].shift(1)).astype(int)
         df["gap_size"] = (df["Open"] - df["Close"].shift(1)) / df["Close"].shift(1)
 
@@ -233,8 +231,6 @@ class IndicatorEngine:
         new_features["vol_regime"] = (df["volatility_10"] > df["volatility_10"].rolling(50).mean()).astype(int)
         rng = df["High"] - df["Low"]
         new_features["range_velocity"] = (rng - rng.shift(1)) / (rng.shift(1) + 0.0001)
-        # fractal_proxy dropped: rare + negative lift in combo search
-        # new_features["fractal_proxy"] = df["ATR_pct"] / (df["volatility_10"] + 0.0001)
 
         self.df = pd.concat([df, new_features], axis=1)
 

@@ -11,10 +11,11 @@ Breakeven win rate before fees = 1 / (1 + reward/risk).
 
 import numpy as np
 import pandas as pd
+from numpy.lib.stride_tricks import sliding_window_view
 from rich.console import Console
 from rich.table import Table
 
-from price_action_engine import PriceActionEngine
+from .price_action_engine import PriceActionEngine
 
 
 def simulate_trades(
@@ -22,80 +23,98 @@ def simulate_trades(
     initial_capital, risk_per_trade_pct, stop_loss_pct, take_profit_pct, max_hold_bars, fee_pct,
     index=None,
 ):
-    """Core bar-by-bar bracket simulation. Shared by Backtester (full trade
+    """Core bracket simulation - vectorized. Shared by Backtester (full trade
     detail incl. timestamps) and ComboBacktester's workers (index=None skips
-    entry_time/exit_time, keeping the payload numpy-only)."""
+    entry_time/exit_time, keeping the payload numpy-only).
+
+    Only two things about this are genuinely sequential: which bars get
+    "consumed" by an already-open trade's holding window (a signal firing
+    mid-trade is skipped, never evaluated), and equity compounding (position
+    size depends on current equity). Resolving *where* any single trade would
+    exit - bar, price, stop-vs-target-vs-time - does not depend on any other
+    trade, only on its own forward OHLC window. So this runs in two passes:
+    a fully vectorized numpy pass resolves every signal-fire's exit in one
+    shot (a sliding window over the forward max_hold_bars candles, no
+    per-trade Python loop), then a cheap sequential pass - one step per
+    signal fire, not per bar - applies the two sequential rules using each
+    fire's already-computed exit info."""
     n = len(open_)
-    equity = initial_capital
+    signal_i = np.flatnonzero(np.asarray(sig)[: n - 1])  # sig[i] != 0, matches `while i < n-1`
+    if len(signal_i) == 0:
+        return [], initial_capital
+
+    directions = np.asarray(sig)[signal_i]
+    entry_i = signal_i + 1  # act on the NEXT candle's open - no lookahead (always < n here)
+    entry_price = open_[entry_i]
+
+    stop_dist = entry_price * (stop_loss_pct / 100)
+    target_dist = entry_price * (take_profit_pct / 100)
+    is_long = directions == 1
+    stop_price = np.where(is_long, entry_price - stop_dist, entry_price + stop_dist)
+    target_price = np.where(is_long, entry_price + target_dist, entry_price - target_dist)
+
+    # Forward window entry_i..entry_i+max_hold_bars inclusive (max_hold_bars+1 bars),
+    # padded with NaN past the real array so every candidate gets a same-length window -
+    # NaN comparisons are always False, so the padding never fabricates a touch.
+    window_len = max_hold_bars + 1
+    pad = np.full(window_len, np.nan)
+    high_windows = sliding_window_view(np.concatenate([high, pad]), window_len)[entry_i]
+    low_windows = sliding_window_view(np.concatenate([low, pad]), window_len)[entry_i]
+
+    stop_col, target_col, is_long_col = stop_price[:, None], target_price[:, None], is_long[:, None]
+    hit_stop = np.where(is_long_col, low_windows <= stop_col, high_windows >= stop_col)
+    hit_target = np.where(is_long_col, high_windows >= target_col, low_windows <= target_col)
+    any_hit = hit_stop | hit_target
+
+    has_hit = any_hit.any(axis=1)
+    first_col = np.argmax(any_hit, axis=1)  # meaningless (unused) where has_hit is False
+    # Same-bar tie -> stop wins, matching the original loop's check order.
+    stop_wins = hit_stop[np.arange(len(signal_i)), first_col]
+    is_stop = has_hit & stop_wins
+    is_target = has_hit & ~stop_wins
+
+    time_exit_i = np.minimum(entry_i + max_hold_bars, n - 1)
+    exit_i = np.where(has_hit, entry_i + first_col, time_exit_i)
+    exit_price = np.where(is_stop, stop_price, np.where(is_target, target_price, close[time_exit_i]))
+
+    # ---- sequential pass: one step per signal fire (not per bar) ----
     trades = []
+    equity = initial_capital
+    next_available_i = 0
+    for k in range(len(signal_i)):
+        i = signal_i[k]
+        if i < next_available_i:
+            continue  # still inside a previous trade's window - never evaluated, matches original
 
-    i = 0
-    while i < n - 1:
-        direction = sig[i]
-        if direction == 0:
-            i += 1
-            continue
-
-        entry_i = i + 1  # act on the NEXT candle's open - no lookahead
-        if entry_i >= n:
-            break
-        entry_price = open_[entry_i]
-
-        stop_dist = entry_price * (stop_loss_pct / 100)
-        target_dist = entry_price * (take_profit_pct / 100)
-        if direction == 1:
-            stop_price = entry_price - stop_dist
-            target_price = entry_price + target_dist
-        else:
-            stop_price = entry_price + stop_dist
-            target_price = entry_price - target_dist
-
-        exit_price, exit_reason, exit_i = None, "time", min(entry_i + max_hold_bars, n - 1)
-
-        for j in range(entry_i, exit_i + 1):
-            if direction == 1:
-                hit_stop = low[j] <= stop_price
-                hit_target = high[j] >= target_price
-            else:
-                hit_stop = high[j] >= stop_price
-                hit_target = low[j] <= target_price
-
-            # If both stop and target were touched in one candle, assume stop hit first.
-            if hit_stop:
-                exit_price, exit_reason, exit_i = stop_price, "stop", j
-                break
-            if hit_target:
-                exit_price, exit_reason, exit_i = target_price, "target", j
-                break
-
-        if exit_price is None:
-            exit_price, exit_reason = close[exit_i], "time"
+        direction = directions[k]
+        ep, xp, xi = entry_price[k], exit_price[k], exit_i[k]
+        reason = "stop" if is_stop[k] else ("target" if is_target[k] else "time")
 
         risk_dollars = equity * (risk_per_trade_pct / 100)
-        position_size = risk_dollars / stop_dist
+        position_size = risk_dollars / stop_dist[k]
 
-        raw_pnl = position_size * (exit_price - entry_price) * direction
-        fee = position_size * entry_price * (fee_pct / 100) * 2  # both legs
+        raw_pnl = position_size * (xp - ep) * direction
+        fee = position_size * ep * (fee_pct / 100) * 2  # both legs
         pnl = raw_pnl - fee
 
         equity += pnl
         trade = {
             "direction": "LONG" if direction == 1 else "SHORT",
-            "entry_price": entry_price,
-            "exit_price": exit_price,
-            "stop_price": stop_price,
-            "target_price": target_price,
+            "entry_price": ep,
+            "exit_price": xp,
+            "stop_price": stop_price[k],
+            "target_price": target_price[k],
             "position_size": position_size,
-            "exit_reason": exit_reason,
+            "exit_reason": reason,
             "pnl": pnl,
             "equity_after": equity,
         }
         if index is not None:
-            trade["entry_time"] = index[entry_i]
-            trade["exit_time"] = index[exit_i]
+            trade["entry_time"] = index[entry_i[k]]
+            trade["exit_time"] = index[xi]
         trades.append(trade)
 
-        i = exit_i + 1  # no overlapping trades for the same signal
+        next_available_i = xi + 1  # no overlapping trades for the same signal
 
     return trades, equity
 

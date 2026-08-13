@@ -1,8 +1,8 @@
 """ReportExporter: runs the combo backtest (if not already computed) and writes
-a single JSON file that `dashboard.html` reads and renders.
+a single JSON file that the ui/ Streamlit app reads and renders.
 
 Usage:
-    ReportExporter(df, config).save("report.json")
+    ReportExporter(df, config).save("data/report.json")
 
 `config` is a plain dict of main.py's settings, passed in to avoid a circular
 import. Optionally pass `precomputed` (combo_backtester instance,
@@ -14,8 +14,8 @@ import math
 
 import pandas as pd
 
-from combo_backtester import ComboBacktester
-from indicator_diagnostics import (
+from .combo_backtester import ComboBacktester
+from .indicator_diagnostics import (
     compute_contribution_stats,
     compute_direction_target_diagnostic,
     compute_redundancy_pairs,
@@ -47,8 +47,8 @@ def _json_safe(value):
 def compact_combo_records(df):
     """Every combo, compacted: condition/signal names dedup into one
     `condition_dictionary` array, each combo stores integer indices into it
-    instead of a repeated " AND "-joined string. Dashboard reconstructs the
-    display string client-side."""
+    instead of a repeated " AND "-joined string - the display string is
+    reconstructed on read (ui/app.py, backtesting/strategy_runner.py)."""
     if df is None or len(df) == 0:
         return [], []
 
@@ -75,7 +75,7 @@ class ReportExporter:
     """Collects the combo backtest into one JSON-serializable dict and writes it out.
 
     Usage:
-        ReportExporter(df, config).save("report.json")
+        ReportExporter(df, config).save("data/report.json")
     """
 
     def __init__(self, df, config, precomputed=None):
@@ -166,9 +166,9 @@ class ReportExporter:
             "combo_backtest": self._combo_backtest_section(),
         }
 
-    def save(self, path="report.json"):
+    def save(self, path="data/report.json"):
         """Compact JSON (no indent) - this file can be hundreds of MB with the
-        full combo search, and it's read by ui.py, not by hand."""
+        full combo search, and it's read by the ui/ Streamlit app, not by hand."""
         report = self.build()
         with open(path, "w") as f:
             json.dump(report, f, default=_json_safe)

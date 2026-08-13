@@ -9,8 +9,6 @@ wheels/
 # Virtual environments
 .venv
 
-# Cached market data
+# Cached market data + generated report (regenerate with strategy_finder/main.py;
+# report.json can balloon past GitHub's 100MB limit)
 data/
-
-# Generated report (regenerate with main.py; can balloon past GitHub's 100MB limit)
-report.json

@@ -25,8 +25,8 @@ import re
 import numpy as np
 import pandas as pd
 
-from backtester import simulate_trades_mfe_mae
-from combo_backtester import ComboBacktester
+from .backtester import simulate_trades_mfe_mae
+from .combo_backtester import ComboBacktester
 
 _LAG_SUFFIX_RE = re.compile(r"\[-(\d+)\]$")
 
