@@ -6,6 +6,15 @@ Directional tagging: each indicator gets a long/short pair by comparing its
 value to its own trailing rolling median (`condition_window`, causal only).
 Each sig_* signal splits into long (`== 1`) / short (`== -1`) halves.
 
+Multi-candle patterns (`lag_depths`): every condition/signal above is ALSO
+added shifted back by each depth in `lag_depths` (default 1/2/3 candles),
+suffixed `[-1]`, `[-2]`, `[-3]` - e.g. `RSI_14>median[-2]` means "RSI_14 was
+above its median 2 candles ago". Since combos AND same-row masks together,
+this is what lets a combo express a real multi-candle pattern (a big-range
+"mother" candle 2 bars back + an inside bar 1 bar back + today's breakout),
+not just conditions that all happen on the same candle. Each lag depth is
+kept independently only if it alone still clears `min_fires`.
+
 Quality filter: constant/all-NaN/never-firing conditions, and any condition
 whose solo fire count is already below `min_fires`, are dropped up front -
 ANDing more conditions in can only shrink fire count, never grow it, so this
@@ -153,6 +162,7 @@ class ComboBacktester:
         min_fires=15,
         console_top_n=20,
         condition_window=100,
+        lag_depths=(1, 2, 3),
         n_workers=None,
         max_raw_candidates_per_level=20_000_000,
         max_survivors_per_level=20_000,
@@ -170,6 +180,7 @@ class ComboBacktester:
         self.min_fires = min_fires
         self.console_top_n = console_top_n
         self.condition_window = condition_window
+        self.lag_depths = tuple(lag_depths)
         self.n_workers = n_workers or max(1, (os.cpu_count() or 2) - 1)  # leave a core free
         # Safety nets: raw-candidate ceiling, survivors-per-level cap, optional
         # time budget. Whichever trips first, combos already found are kept.
@@ -183,13 +194,33 @@ class ComboBacktester:
     # ------------------------------------------------------------------
     # Build the long/short condition + signal pools
     # ------------------------------------------------------------------
+    def _add_with_lags(self, pool, base_name, mask):
+        """Adds `mask` as-of-now plus a shifted-back copy for each depth in
+        `self.lag_depths` (a condition/signal that was true k candles ago,
+        named e.g. `RSI_14>median[-2]`), each kept independently only if it
+        alone still clears `min_fires`. Returns whether anything was added,
+        for the caller's dropped-column bookkeeping."""
+        added = False
+        if int(np.count_nonzero(mask)) >= self.min_fires:
+            pool[base_name] = mask
+            added = True
+        for k in self.lag_depths:
+            shifted = np.zeros_like(mask)
+            shifted[k:] = mask[:-k]
+            if int(np.count_nonzero(shifted)) >= self.min_fires:
+                pool[f"{base_name}[-{k}]"] = shifted
+                added = True
+        return added
+
     def _build_pools(self):
         """Every indicator column gets an automatic long/short condition
         pair: is it currently above or below its own trailing rolling median?
         Every sig_* price-action signal is split into its long (`== 1`) and
-        short (`== -1`) half. A condition/signal that is constant, never
-        fires, or fires fewer than `min_fires` times on its own is dropped -
-        see the module docstring for why that loses no reachable result."""
+        short (`== -1`) half. Each of those also gets a `[-k]` "k candles
+        ago" copy per `self.lag_depths` - see the module docstring. A
+        condition/signal that is constant, never fires, or fires fewer than
+        `min_fires` times on its own (at every lag depth) is dropped - see
+        the module docstring for why that loses no reachable result."""
         df = self.df
 
         # swing_high/low_at_pivot use a centered window (needs future bars to
@@ -214,14 +245,9 @@ class ComboBacktester:
             rolling_median = series.rolling(self.condition_window, min_periods=self.condition_window).median()
             above = (series > rolling_median).to_numpy()
             below = (series < rolling_median).to_numpy()
-            kept = False
-            if int(np.count_nonzero(above)) >= self.min_fires:
-                long_pool[f"{col}>median"] = above
-                kept = True
-            if int(np.count_nonzero(below)) >= self.min_fires:
-                short_pool[f"{col}<median"] = below
-                kept = True
-            if not kept:
+            kept_above = self._add_with_lags(long_pool, f"{col}>median", above)
+            kept_below = self._add_with_lags(short_pool, f"{col}<median", below)
+            if not (kept_above or kept_below):
                 dropped.append(col)
 
         for col in [c for c in df.columns if c.startswith("sig_")]:
@@ -229,14 +255,9 @@ class ComboBacktester:
             name = col.replace("sig_", "")
             long_mask = arr == 1
             short_mask = arr == -1
-            kept = False
-            if int(np.count_nonzero(long_mask)) >= self.min_fires:
-                long_pool[f"{name}(L)"] = long_mask
-                kept = True
-            if int(np.count_nonzero(short_mask)) >= self.min_fires:
-                short_pool[f"{name}(S)"] = short_mask
-                kept = True
-            if not kept:
+            kept_long = self._add_with_lags(long_pool, f"{name}(L)", long_mask)
+            kept_short = self._add_with_lags(short_pool, f"{name}(S)", short_mask)
+            if not (kept_long or kept_short):
                 dropped.append(col)
 
         self.dropped_columns = dropped
@@ -556,24 +577,8 @@ class ComboBacktester:
             console.print("None were profitable under these realistic assumptions.")
             return profitable
 
-        shown = profitable.head(self.console_top_n)
-        title = f"Top {len(shown)} of {len(profitable)} profitable combinations, best PnL first"
-        if len(profitable) > len(shown):
-            title += " (see report.json / dashboard for more)"
-
-        table = self._make_table(title, shown, numbered=True)
-        console.print(table)
-
-        # Best combo per distinct size - shows the top pattern at each complexity level.
-        best_idx = profitable.groupby("size")["total_pnl"].idxmax()
-        best_per_size = profitable.loc[best_idx].sort_values("size").reset_index(drop=True)
-        console.print(self._make_table("Best combo at each size", best_per_size, numbered=False, size_col=True))
-
-        top_winrate = profitable.sort_values(
-            ["win_rate_pct", "total_pnl"], ascending=[False, False]
-        ).head(5).reset_index(drop=True)
-        console.print(self._make_table("Top 5 by win rate", top_winrate, numbered=True))
-
+        # Full breakdown (top combos, best-per-size, top win rate) lives in report.json / the
+        # ui.py dashboard now - keeping the console output to a short summary here.
         best = profitable.iloc[0]
         console.print(
             f"\n[bold]Best combo overall:[/bold] [{best['direction']}] {best['combo']} (size {best['size']}) -> "

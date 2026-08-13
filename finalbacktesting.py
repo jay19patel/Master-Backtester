@@ -15,6 +15,7 @@ Output:
 
 import json
 import math
+import re
 
 import numpy as np
 import pandas as pd
@@ -30,9 +31,18 @@ TOP_N_PER_SIDE = 20  # how many Long / how many Short combos the dashboard gets 
 # ----------------------------------------------------------------------
 # Rebuilding a combo's boolean mask from its condition names
 # ----------------------------------------------------------------------
+_LAG_SUFFIX_RE = re.compile(r"\[-(\d+)\]$")
+
+
 def resolve_condition_mask(df, condition, condition_window):
     """Reconstructs the exact boolean mask ComboBacktester used for one
-    condition name, e.g. "RSI_7>median" or "sweep_reversal(L)"."""
+    condition name, e.g. "RSI_7>median", "sweep_reversal(L)", or a
+    multi-candle "k candles ago" copy like "RSI_7>median[-2]"."""
+    lag_match = _LAG_SUFFIX_RE.search(condition)
+    if lag_match:
+        k = int(lag_match.group(1))
+        base_mask = resolve_condition_mask(df, condition[: lag_match.start()], condition_window)
+        return base_mask.shift(k, fill_value=False)
     if condition.endswith("(L)") or condition.endswith("(S)"):
         name = condition[:-3]
         is_long = condition.endswith("(L)")
@@ -76,6 +86,7 @@ def find_top_combos(df, console):
         min_combo_size=cfg.COMBO_MIN_SIZE,
         max_combo_size=cfg.COMBO_MAX_SIZE,
         min_fires=cfg.COMBO_MIN_FIRES,
+        lag_depths=cfg.COMBO_LAG_DEPTHS,
         console_top_n=cfg.COMBO_CONSOLE_TOP_N,
         n_workers=cfg.COMBO_N_WORKERS,
         max_raw_candidates_per_level=cfg.COMBO_MAX_RAW_CANDIDATES_PER_LEVEL,

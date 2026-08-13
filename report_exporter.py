@@ -15,6 +15,12 @@ import math
 import pandas as pd
 
 from combo_backtester import ComboBacktester
+from indicator_diagnostics import (
+    compute_contribution_stats,
+    compute_direction_target_diagnostic,
+    compute_redundancy_pairs,
+    find_perfect_predictors,
+)
 
 OHLCV_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 
@@ -121,6 +127,20 @@ class ReportExporter:
 
         condition_dictionary, combinations = compact_combo_records(profitable)
 
+        _, indicator_cols, _ = self._column_groups()
+        contribution = compute_contribution_stats(condition_dictionary, combinations)
+        redundancy = compute_redundancy_pairs(self.df, indicator_cols, threshold=0.9)
+        perfect_predictors = find_perfect_predictors(combinations, condition_dictionary)
+        direction_target_diagnostic = compute_direction_target_diagnostic(
+            self.df,
+            condition_window=self.config.get("combo_condition_window", 100),
+            lag_depths=tuple(self.config.get("combo_lag_depths", (1, 2, 3))),
+            min_fires=self.config.get("combo_min_fires", 15),
+            take_profit_pct=self.config["backtest_take_profit_pct"],
+            stop_loss_pct=self.config["backtest_stop_loss_pct"],
+            max_hold_bars=self.config["backtest_max_hold_bars"],
+        )
+
         return {
             "config": {
                 "min_combo_size": self.config.get("combo_min_size", 1),
@@ -132,6 +152,10 @@ class ReportExporter:
             },
             "condition_dictionary": condition_dictionary,
             "combinations": combinations,
+            "indicator_contribution": contribution,
+            "indicator_redundancy": redundancy,
+            "perfect_predictors": perfect_predictors,
+            "direction_target_diagnostic": direction_target_diagnostic,
         }
 
     def build(self):
@@ -143,8 +167,10 @@ class ReportExporter:
         }
 
     def save(self, path="report.json"):
+        """Compact JSON (no indent) - this file can be hundreds of MB with the
+        full combo search, and it's read by ui.py, not by hand."""
         report = self.build()
         with open(path, "w") as f:
-            json.dump(report, f, indent=2, default=_json_safe)
+            json.dump(report, f, default=_json_safe)
         print(f"[ReportExporter] Saved -> {path}")
         return path

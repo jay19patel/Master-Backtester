@@ -150,8 +150,9 @@ class IndicatorEngine:
         df["supertrend"] = supertrend["SUPERT_10_3"].bfill()
         df["supertrend_direction"] = supertrend["SUPERTd_10_3"].bfill()
 
-        df["st_flip"] = df["supertrend_direction"].diff().abs()
-        df["bars_since_flip"] = df.groupby((df["st_flip"] == 2).cumsum()).cumcount()
+        # st_flip dropped: rare + negative lift in combo search (kept internally - bars_since_flip needs it)
+        st_flip = df["supertrend_direction"].diff().abs()
+        df["bars_since_flip"] = df.groupby((st_flip == 2).cumsum()).cumcount()
 
         aroon = ta.aroon(df["High"], df["Low"], length=25)
         df["aroon_up"] = aroon["AROONU_25"].bfill()
@@ -188,7 +189,17 @@ class IndicatorEngine:
         df["is_bullish"] = (df["Close"] > df["Open"]).astype(int)
         df["candle_strength"] = abs(df["Close"] - df["Open"]) / (df["High"] - df["Low"] + 0.0001)
 
-        df["gap_up"] = (df["Open"] > df["Close"].shift(1)).astype(int)
+        # Raw multi-candle building blocks - deliberately atomic (no baked-in breakout/direction
+        # logic) so the combo search's own lag_depths AND-ing can discover multi-bar sequences
+        # itself (e.g. a wide-range candle N bars back + an inside bar recently), rather than us
+        # hand-coding one fixed version of a "mother candle" pattern.
+        rng = df["High"] - df["Low"]
+        df["is_inside_bar"] = ((df["High"] < df["High"].shift(1)) & (df["Low"] > df["Low"].shift(1))).astype(int)
+        df["is_wide_range_candle"] = (rng > 1.5 * df["ATR_14"]).astype(int)
+        df["is_narrow_range_candle"] = (rng == rng.rolling(7).min()).astype(int)
+
+        # gap_up dropped: rare + negative lift in combo search
+        # df["gap_up"] = (df["Open"] > df["Close"].shift(1)).astype(int)
         df["gap_down"] = (df["Open"] < df["Close"].shift(1)).astype(int)
         df["gap_size"] = (df["Open"] - df["Close"].shift(1)) / df["Close"].shift(1)
 
@@ -222,7 +233,8 @@ class IndicatorEngine:
         new_features["vol_regime"] = (df["volatility_10"] > df["volatility_10"].rolling(50).mean()).astype(int)
         rng = df["High"] - df["Low"]
         new_features["range_velocity"] = (rng - rng.shift(1)) / (rng.shift(1) + 0.0001)
-        new_features["fractal_proxy"] = df["ATR_pct"] / (df["volatility_10"] + 0.0001)
+        # fractal_proxy dropped: rare + negative lift in combo search
+        # new_features["fractal_proxy"] = df["ATR_pct"] / (df["volatility_10"] + 0.0001)
 
         self.df = pd.concat([df, new_features], axis=1)
 

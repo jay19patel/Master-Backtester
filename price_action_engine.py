@@ -31,6 +31,8 @@ class PriceActionEngine:
     def _ensure_base_indicators(self):
         df = self.df
 
+        if "EMA_10" not in df.columns:
+            df["EMA_10"] = ta.ema(df["Close"], length=10).bfill()
         if "EMA_20" not in df.columns:
             df["EMA_20"] = ta.ema(df["Close"], length=20).bfill()
         if "EMA_50" not in df.columns:
@@ -39,8 +41,10 @@ class PriceActionEngine:
             df["RSI_14"] = ta.rsi(df["Close"], length=14).bfill()
         if "ATR_14" not in df.columns:
             df["ATR_14"] = ta.atr(df["High"], df["Low"], df["Close"], length=14).bfill()
-        if "MACD_hist" not in df.columns:
+        if "MACD_hist" not in df.columns or "MACD" not in df.columns or "MACD_signal" not in df.columns:
             macd = ta.macd(df["Close"], fast=12, slow=26, signal=9)
+            df["MACD"] = macd["MACD_12_26_9"].bfill()
+            df["MACD_signal"] = macd["MACDs_12_26_9"].bfill()
             df["MACD_hist"] = macd["MACDh_12_26_9"].bfill()
         if "ADX_14" not in df.columns:
             adx = ta.adx(df["High"], df["Low"], df["Close"], length=14)
@@ -72,13 +76,17 @@ class PriceActionEngine:
             ("swing highs/lows", self.add_swings),
             ("market structure (BOS/CHoCH, HH/HL/LH/LL)", self.add_market_structure),
             ("candlestick signals (engulfing, pin bar)", self.add_candlestick_signals),
+            ("trend/momentum crossovers", self.add_crossover_signals),
             ("breakout signals (Donchian, S/R, squeeze)", self.add_breakout_signals),
             ("smart money (order blocks, FVG, sweeps)", self.add_smart_money_signals),
             ("pullback signals (EMA, golden zone, VWAP)", self.add_pullback_signals),
             ("fibonacci retracement/extension", self.add_fibonacci_signals),
-            ("dynamic trendline breaks", self.add_trendline_signals),
+            # sig_trendline_break dropped: rare + negative lift in combo search (also the
+            # slowest step in the pipeline - skipping it saves time too)
+            # ("dynamic trendline breaks", self.add_trendline_signals),
             ("range contraction (inside bar, NR7)", self.add_range_signals),
-            ("divergence signals (RSI vs price)", self.add_divergence_signals),
+            # sig_rsi_divergence dropped: rare + negative lift in combo search
+            # ("divergence signals (RSI vs price)", self.add_divergence_signals),
             ("combination signals (confluence, BOS+retest)", self.add_combination_signals),
         ]
         for label, step in steps:
@@ -111,15 +119,17 @@ class PriceActionEngine:
         confirmed_high = df["High"].where(is_ph).shift(right)
         confirmed_low = df["Low"].where(is_pl).shift(right)
         df["last_swing_high"] = confirmed_high.ffill()
-        df["last_swing_low"] = confirmed_low.ffill()
+        # last_swing_low dropped: rare + negative lift in combo search. Kept internally (not a
+        # df column) - still used by market structure, sweeps, pullbacks, fib, retest below.
+        self._last_swing_low = confirmed_low.ffill()
 
         df["bars_since_swing_high"] = df.groupby(confirmed_high.notna().cumsum()).cumcount()
         df["bars_since_swing_low"] = df.groupby(confirmed_low.notna().cumsum()).cumcount()
 
-        # raw swing-level break, no trend state (see BOS below)
-        cross_up = (df["Close"] > df["last_swing_high"]) & (df["Close"].shift(1) <= df["last_swing_high"].shift(1))
-        cross_dn = (df["Close"] < df["last_swing_low"]) & (df["Close"].shift(1) >= df["last_swing_low"].shift(1))
-        df["sig_swing_break"] = np.where(cross_up, 1, np.where(cross_dn, -1, 0))
+        # sig_swing_break dropped: rare + negative lift in combo search
+        # cross_up = (df["Close"] > df["last_swing_high"]) & (df["Close"].shift(1) <= df["last_swing_high"].shift(1))
+        # cross_dn = (df["Close"] < self._last_swing_low) & (df["Close"].shift(1) >= self._last_swing_low.shift(1))
+        # df["sig_swing_break"] = np.where(cross_up, 1, np.where(cross_dn, -1, 0))
 
         # used by add_market_structure below
         self._confirmed_high = confirmed_high
@@ -140,7 +150,7 @@ class PriceActionEngine:
 
         closes = df["Close"].to_numpy()
         lsh = df["last_swing_high"].to_numpy()
-        lsl = df["last_swing_low"].to_numpy()
+        lsl = self._last_swing_low.to_numpy()
 
         bos = np.zeros(n)
         choch = np.zeros(n)
@@ -174,8 +184,10 @@ class PriceActionEngine:
             trend_arr[i] = trend
 
         df["structure_trend"] = trend_arr
-        df["sig_bos"] = bos
-        df["sig_choch"] = choch
+        # sig_bos / sig_choch dropped: rare + negative lift in combo search (also removes their
+        # only consumers, sig_bos_retest and sig_super_confluence, in add_combination_signals)
+        # df["sig_bos"] = bos
+        # df["sig_choch"] = choch
 
         # separate arrays so a same-bar high+low don't clobber each other
         label_high = np.zeros(n)
@@ -234,6 +246,32 @@ class PriceActionEngine:
         return self
 
     # ------------------------------------------------------------------
+    # 3b. Trend/momentum crossovers
+    # ------------------------------------------------------------------
+    def add_crossover_signals(self):
+        """Fresh-cross events (fire only on the bar of the cross, +1/-1) for pairs
+        not already captured by the level-based indicator>median conditions:
+        EMA10/EMA20, EMA20/EMA50, MACD/MACD_signal, Close/VWAP, Close/EMA20,
+        and RSI_14 crossing 50 (momentum flip)."""
+        df = self.df
+
+        def cross(fast, slow):
+            up = (fast > slow) & (fast.shift(1) <= slow.shift(1))
+            dn = (fast < slow) & (fast.shift(1) >= slow.shift(1))
+            return np.where(up, 1, np.where(dn, -1, 0))
+
+        df["sig_ema_10_20_cross"] = cross(df["EMA_10"], df["EMA_20"])
+        df["sig_ema_20_50_cross"] = cross(df["EMA_20"], df["EMA_50"])
+        df["sig_macd_signal_cross"] = cross(df["MACD"], df["MACD_signal"])
+        df["sig_price_vwap_cross"] = cross(df["Close"], df["VWAP"])
+        df["sig_price_ema20_cross"] = cross(df["Close"], df["EMA_20"])
+
+        rsi_up = (df["RSI_14"] > 50) & (df["RSI_14"].shift(1) <= 50)
+        rsi_dn = (df["RSI_14"] < 50) & (df["RSI_14"].shift(1) >= 50)
+        df["sig_rsi50_cross"] = np.where(rsi_up, 1, np.where(rsi_dn, -1, 0))
+        return self
+
+    # ------------------------------------------------------------------
     # 4. Breakout signals
     # ------------------------------------------------------------------
     def add_breakout_signals(self):
@@ -253,25 +291,27 @@ class PriceActionEngine:
 
         # --- S/R breakout: strongest of the last 3 confirmed pivots ---
         ch = self._confirmed_high.copy()
-        cl = self._confirmed_low.copy()
         resistance = ch.dropna().rolling(3).max().reindex(df.index).ffill()
-        support = cl.dropna().rolling(3).min().reindex(df.index).ffill()
         df["resistance_level"] = resistance
-        df["support_level"] = support
-        res_break = (df["Close"] > resistance) & (df["Close"].shift(1) <= resistance.shift(1))
-        sup_break = (df["Close"] < support) & (df["Close"].shift(1) >= support.shift(1))
-        df["sig_sr_breakout"] = np.where(res_break, 1, np.where(sup_break, -1, 0))
+        # support_level / sig_sr_breakout dropped: rare + negative lift in combo search
+        # cl = self._confirmed_low.copy()
+        # support = cl.dropna().rolling(3).min().reindex(df.index).ffill()
+        # df["support_level"] = support
+        # res_break = (df["Close"] > resistance) & (df["Close"].shift(1) <= resistance.shift(1))
+        # sup_break = (df["Close"] < support) & (df["Close"].shift(1) >= support.shift(1))
+        # df["sig_sr_breakout"] = np.where(res_break, 1, np.where(sup_break, -1, 0))
 
         # --- TTM squeeze breakout ---
         squeeze_on = (df["BB_upper"] < df["KC_upper"]) & (df["BB_lower"] > df["KC_lower"])
-        squeeze_released = squeeze_on.shift(1, fill_value=False) & ~squeeze_on
-        momentum_up = df["Close"] > df["BB_middle"]
-        volume_ok = df["volume_ratio"] > 1.2
         df["squeeze_on"] = squeeze_on.astype(int)
-        df["sig_squeeze_breakout"] = np.where(
-            squeeze_released & momentum_up & volume_ok, 1,
-            np.where(squeeze_released & ~momentum_up & volume_ok, -1, 0),
-        )
+        # sig_squeeze_breakout dropped: rare + negative lift in combo search
+        # squeeze_released = squeeze_on.shift(1, fill_value=False) & ~squeeze_on
+        # momentum_up = df["Close"] > df["BB_middle"]
+        # volume_ok = df["volume_ratio"] > 1.2
+        # df["sig_squeeze_breakout"] = np.where(
+        #     squeeze_released & momentum_up & volume_ok, 1,
+        #     np.where(squeeze_released & ~momentum_up & volume_ok, -1, 0),
+        # )
         return self
 
     # ------------------------------------------------------------------
@@ -296,48 +336,49 @@ class PriceActionEngine:
         max_age = self.max_zone_age
         max_zones = self.max_active_zones
 
-        # --- Order blocks (multi-zone, age + invalidation aware) ---
-        ob_sig = np.zeros(n)
-        bull_zones = []  # each: {"lo":.., "hi":.., "birth":i}
-        bear_zones = []
-
-        for i in range(3, n):
-            if c[i] - c[i - 3] > 1.5 * atr[i]:
-                for j in range(i - 1, max(i - 4, 0) - 1, -1):
-                    if c[j] < o[j]:
-                        if not bull_zones or (low[j], h[j]) != (bull_zones[-1]["lo"], bull_zones[-1]["hi"]):
-                            bull_zones.append({"lo": low[j], "hi": h[j], "birth": i})
-                            if len(bull_zones) > max_zones:
-                                bull_zones.pop(0)
-                        break
-            if c[i - 3] - c[i] > 1.5 * atr[i]:
-                for j in range(i - 1, max(i - 4, 0) - 1, -1):
-                    if c[j] > o[j]:
-                        if not bear_zones or (low[j], h[j]) != (bear_zones[-1]["lo"], bear_zones[-1]["hi"]):
-                            bear_zones.append({"lo": low[j], "hi": h[j], "birth": i})
-                            if len(bear_zones) > max_zones:
-                                bear_zones.pop(0)
-                        break
-
-            fired = False
-            for zone in list(bull_zones):
-                if i - zone["birth"] > max_age or c[i] < zone["lo"] - atr[i]:
-                    bull_zones.remove(zone)
-                    continue
-                if not fired and low[i] <= zone["hi"] and c[i] > zone["hi"] and c[i] > o[i]:
-                    ob_sig[i] = 1
-                    bull_zones.remove(zone)
-                    fired = True
-            for zone in list(bear_zones):
-                if i - zone["birth"] > max_age or c[i] > zone["hi"] + atr[i]:
-                    bear_zones.remove(zone)
-                    continue
-                if not fired and h[i] >= zone["lo"] and c[i] < zone["lo"] and c[i] < o[i]:
-                    ob_sig[i] = -1
-                    bear_zones.remove(zone)
-                    fired = True
-
-        df["sig_ob_retest"] = ob_sig
+        # sig_ob_retest dropped: rare + negative lift in combo search
+        # # --- Order blocks (multi-zone, age + invalidation aware) ---
+        # ob_sig = np.zeros(n)
+        # bull_zones = []  # each: {"lo":.., "hi":.., "birth":i}
+        # bear_zones = []
+        #
+        # for i in range(3, n):
+        #     if c[i] - c[i - 3] > 1.5 * atr[i]:
+        #         for j in range(i - 1, max(i - 4, 0) - 1, -1):
+        #             if c[j] < o[j]:
+        #                 if not bull_zones or (low[j], h[j]) != (bull_zones[-1]["lo"], bull_zones[-1]["hi"]):
+        #                     bull_zones.append({"lo": low[j], "hi": h[j], "birth": i})
+        #                     if len(bull_zones) > max_zones:
+        #                         bull_zones.pop(0)
+        #                 break
+        #     if c[i - 3] - c[i] > 1.5 * atr[i]:
+        #         for j in range(i - 1, max(i - 4, 0) - 1, -1):
+        #             if c[j] > o[j]:
+        #                 if not bear_zones or (low[j], h[j]) != (bear_zones[-1]["lo"], bear_zones[-1]["hi"]):
+        #                     bear_zones.append({"lo": low[j], "hi": h[j], "birth": i})
+        #                     if len(bear_zones) > max_zones:
+        #                         bear_zones.pop(0)
+        #                 break
+        #
+        #     fired = False
+        #     for zone in list(bull_zones):
+        #         if i - zone["birth"] > max_age or c[i] < zone["lo"] - atr[i]:
+        #             bull_zones.remove(zone)
+        #             continue
+        #         if not fired and low[i] <= zone["hi"] and c[i] > zone["hi"] and c[i] > o[i]:
+        #             ob_sig[i] = 1
+        #             bull_zones.remove(zone)
+        #             fired = True
+        #     for zone in list(bear_zones):
+        #         if i - zone["birth"] > max_age or c[i] > zone["hi"] + atr[i]:
+        #             bear_zones.remove(zone)
+        #             continue
+        #         if not fired and h[i] >= zone["lo"] and c[i] < zone["lo"] and c[i] < o[i]:
+        #             ob_sig[i] = -1
+        #             bear_zones.remove(zone)
+        #             fired = True
+        #
+        # df["sig_ob_retest"] = ob_sig
 
         # --- Fair value gaps (multi-zone, age + invalidation aware) ---
         fvg_sig = np.zeros(n)
@@ -375,7 +416,7 @@ class PriceActionEngine:
         df["sig_fvg_fill"] = fvg_sig
 
         # --- Liquidity sweep / stop hunt (vectorised, unchanged) ---
-        lsl = df["last_swing_low"]
+        lsl = self._last_swing_low
         lsh = df["last_swing_high"]
         bull_sweep = (df["Low"] < lsl) & (df["Close"] > lsl) & (df["Close"] > df["Open"])
         bear_sweep = (df["High"] > lsh) & (df["Close"] < lsh) & (df["Close"] < df["Open"])
@@ -406,7 +447,7 @@ class PriceActionEngine:
 
         # --- Golden zone (fib 0.5 - 0.618 of the last confirmed impulse) ---
         lsh = df["last_swing_high"]
-        lsl = df["last_swing_low"]
+        lsl = self._last_swing_low
         impulse = lsh - lsl
         gz_top_up = lsh - 0.5 * impulse
         gz_bot_up = lsh - 0.618 * impulse
@@ -423,14 +464,14 @@ class PriceActionEngine:
             np.where((df["structure_trend"] == -1) & in_gz_dn & bear_candle, -1, 0),
         )
 
-        # --- VWAP reclaim with volume ---
-        cross_up = (df["Close"] > df["VWAP"]) & (df["Close"].shift(1) <= df["VWAP"].shift(1))
-        cross_dn = (df["Close"] < df["VWAP"]) & (df["Close"].shift(1) >= df["VWAP"].shift(1))
-        vol_surge = df["volume_ratio"] > 1.5
-        df["sig_vwap_reclaim"] = np.where(
-            cross_up & vol_surge & (df["structure_trend"] >= 0), 1,
-            np.where(cross_dn & vol_surge & (df["structure_trend"] <= 0), -1, 0),
-        )
+        # sig_vwap_reclaim dropped: rare + negative lift in combo search
+        # cross_up = (df["Close"] > df["VWAP"]) & (df["Close"].shift(1) <= df["VWAP"].shift(1))
+        # cross_dn = (df["Close"] < df["VWAP"]) & (df["Close"].shift(1) >= df["VWAP"].shift(1))
+        # vol_surge = df["volume_ratio"] > 1.5
+        # df["sig_vwap_reclaim"] = np.where(
+        #     cross_up & vol_surge & (df["structure_trend"] >= 0), 1,
+        #     np.where(cross_dn & vol_surge & (df["structure_trend"] <= 0), -1, 0),
+        # )
         return self
 
     # ------------------------------------------------------------------
@@ -446,7 +487,7 @@ class PriceActionEngine:
         df = self.df
 
         lsh = df["last_swing_high"]
-        lsl = df["last_swing_low"]
+        lsl = self._last_swing_low
         impulse = (lsh - lsl).abs()
         bull_candle = df["Close"] > df["Open"]
         bear_candle = df["Close"] < df["Open"]
@@ -465,19 +506,19 @@ class PriceActionEngine:
             np.where((df["structure_trend"] == -1) & in_zone_dn & bear_candle, -1, 0),
         )
 
-        # --- Extension zone (127.2% - 161.8%) beyond the impulse origin ---
-        ext_up_lo = lsh + 0.272 * impulse
-        ext_up_hi = lsh + 0.618 * impulse
-        ext_dn_hi = lsl - 0.272 * impulse
-        ext_dn_lo = lsl - 0.618 * impulse
-
-        hit_ext_up = (df["High"] >= ext_up_lo) & (df["High"] <= ext_up_hi)
-        hit_ext_dn = (df["Low"] <= ext_dn_hi) & (df["Low"] >= ext_dn_lo)
-
-        df["sig_fib_extension"] = np.where(
-            (df["structure_trend"] == 1) & hit_ext_up & bear_candle, -1,
-            np.where((df["structure_trend"] == -1) & hit_ext_dn & bull_candle, 1, 0),
-        )
+        # sig_fib_extension dropped: rare + negative lift in combo search
+        # ext_up_lo = lsh + 0.272 * impulse
+        # ext_up_hi = lsh + 0.618 * impulse
+        # ext_dn_hi = lsl - 0.272 * impulse
+        # ext_dn_lo = lsl - 0.618 * impulse
+        #
+        # hit_ext_up = (df["High"] >= ext_up_lo) & (df["High"] <= ext_up_hi)
+        # hit_ext_dn = (df["Low"] <= ext_dn_hi) & (df["Low"] >= ext_dn_lo)
+        #
+        # df["sig_fib_extension"] = np.where(
+        #     (df["structure_trend"] == 1) & hit_ext_up & bear_candle, -1,
+        #     np.where((df["structure_trend"] == -1) & hit_ext_dn & bull_candle, 1, 0),
+        # )
         return self
 
     # ------------------------------------------------------------------
@@ -536,10 +577,11 @@ class PriceActionEngine:
         df = self.df
         rng = df["High"] - df["Low"]
 
-        inside = (df["High"] < df["High"].shift(1)) & (df["Low"] > df["Low"].shift(1))
-        break_up = inside.shift(1, fill_value=False) & (df["Close"] > df["High"].shift(1))
-        break_dn = inside.shift(1, fill_value=False) & (df["Close"] < df["Low"].shift(1))
-        df["sig_inside_bar_breakout"] = np.where(break_up, 1, np.where(break_dn, -1, 0))
+        # sig_inside_bar_breakout dropped: rare + negative lift in combo search
+        # inside = (df["High"] < df["High"].shift(1)) & (df["Low"] > df["Low"].shift(1))
+        # break_up = inside.shift(1, fill_value=False) & (df["Close"] > df["High"].shift(1))
+        # break_dn = inside.shift(1, fill_value=False) & (df["Close"] < df["Low"].shift(1))
+        # df["sig_inside_bar_breakout"] = np.where(break_up, 1, np.where(break_dn, -1, 0))
 
         is_nr7 = rng == rng.rolling(7).min()
         nr7_break_up = is_nr7.shift(1, fill_value=False) & (df["Close"] > df["High"].shift(1))
@@ -597,10 +639,10 @@ class PriceActionEngine:
     # ------------------------------------------------------------------
     def add_combination_signals(self):
         """trend_score sums EMA stack + supertrend + MACD sign + ADX-filtered DI bias
-        + VWAP side (range -5..+5). sig_trend_confluence fires only when the score
-        CROSSES +-4 (fresh alignment, not every bar). sig_bos_retest: break-and-retest
-        within 0.25 ATR. sig_sweep_reversal: sweep + reversal candle. sig_super_confluence:
-        structure + score + volume all agree on a fresh break (strictest, rarest)."""
+        + VWAP side (range -5..+5).
+        sig_trend_confluence, sig_bos_retest, sig_sweep_reversal, sig_super_confluence all
+        dropped: rare + negative lift in combo search (sig_bos_retest/sig_super_confluence
+        also depended on the now-dropped sig_bos/sig_choch)."""
         needed = ["structure_trend", "sig_sweep", "sig_engulfing"]
         if any(col not in self.df.columns for col in needed):
             self.add_market_structure()
@@ -617,67 +659,67 @@ class PriceActionEngine:
             + np.sign(df["Close"] - df["VWAP"])
         )
         df["trend_score"] = votes
-        fresh_up = (votes >= 4) & (votes.shift(1) < 4)
-        fresh_dn = (votes <= -4) & (votes.shift(1) > -4)
-        df["sig_trend_confluence"] = np.where(fresh_up, 1, np.where(fresh_dn, -1, 0))
+        # fresh_up = (votes >= 4) & (votes.shift(1) < 4)
+        # fresh_dn = (votes <= -4) & (votes.shift(1) > -4)
+        # df["sig_trend_confluence"] = np.where(fresh_up, 1, np.where(fresh_dn, -1, 0))
 
         # --- BOS + retest ---
-        n = len(df)
-        c = df["Close"].to_numpy()
-        low = df["Low"].to_numpy()
-        h = df["High"].to_numpy()
-        o = df["Open"].to_numpy()
-        atr = df["ATR_14"].to_numpy()
-        bos = df["sig_bos"].to_numpy() + df["sig_choch"].to_numpy()
-        lsh = df["last_swing_high"].to_numpy()
-        lsl = df["last_swing_low"].to_numpy()
-
-        retest_sig = np.zeros(n)
-        pending_up_level = np.nan  # broken resistance waiting for a retest
-        pending_dn_level = np.nan
-        max_wait = 30  # candles a retest stays valid
-        up_age = dn_age = 0
-
-        for i in range(n):
-            if bos[i] > 0:
-                pending_up_level, up_age = lsh[i], 0
-                pending_dn_level = np.nan
-            elif bos[i] < 0:
-                pending_dn_level, dn_age = lsl[i], 0
-                pending_up_level = np.nan
-
-            if not np.isnan(pending_up_level):
-                up_age += 1
-                touched = low[i] <= pending_up_level + 0.25 * atr[i]
-                if touched and c[i] > pending_up_level and c[i] > o[i]:
-                    retest_sig[i] = 1
-                    pending_up_level = np.nan
-                elif c[i] < pending_up_level - 0.5 * atr[i] or up_age > max_wait:
-                    pending_up_level = np.nan  # retest failed / expired
-
-            if not np.isnan(pending_dn_level):
-                dn_age += 1
-                touched = h[i] >= pending_dn_level - 0.25 * atr[i]
-                if touched and c[i] < pending_dn_level and c[i] < o[i]:
-                    retest_sig[i] = -1
-                    pending_dn_level = np.nan
-                elif c[i] > pending_dn_level + 0.5 * atr[i] or dn_age > max_wait:
-                    pending_dn_level = np.nan
-
-        df["sig_bos_retest"] = retest_sig
+        # n = len(df)
+        # c = df["Close"].to_numpy()
+        # low = df["Low"].to_numpy()
+        # h = df["High"].to_numpy()
+        # o = df["Open"].to_numpy()
+        # atr = df["ATR_14"].to_numpy()
+        # bos = df["sig_bos"].to_numpy() + df["sig_choch"].to_numpy()
+        # lsh = df["last_swing_high"].to_numpy()
+        # lsl = self._last_swing_low.to_numpy()
+        #
+        # retest_sig = np.zeros(n)
+        # pending_up_level = np.nan  # broken resistance waiting for a retest
+        # pending_dn_level = np.nan
+        # max_wait = 30  # candles a retest stays valid
+        # up_age = dn_age = 0
+        #
+        # for i in range(n):
+        #     if bos[i] > 0:
+        #         pending_up_level, up_age = lsh[i], 0
+        #         pending_dn_level = np.nan
+        #     elif bos[i] < 0:
+        #         pending_dn_level, dn_age = lsl[i], 0
+        #         pending_up_level = np.nan
+        #
+        #     if not np.isnan(pending_up_level):
+        #         up_age += 1
+        #         touched = low[i] <= pending_up_level + 0.25 * atr[i]
+        #         if touched and c[i] > pending_up_level and c[i] > o[i]:
+        #             retest_sig[i] = 1
+        #             pending_up_level = np.nan
+        #         elif c[i] < pending_up_level - 0.5 * atr[i] or up_age > max_wait:
+        #             pending_up_level = np.nan  # retest failed / expired
+        #
+        #     if not np.isnan(pending_dn_level):
+        #         dn_age += 1
+        #         touched = h[i] >= pending_dn_level - 0.25 * atr[i]
+        #         if touched and c[i] < pending_dn_level and c[i] < o[i]:
+        #             retest_sig[i] = -1
+        #             pending_dn_level = np.nan
+        #         elif c[i] > pending_dn_level + 0.5 * atr[i] or dn_age > max_wait:
+        #             pending_dn_level = np.nan
+        #
+        # df["sig_bos_retest"] = retest_sig
 
         # --- Sweep + reversal confirmation ---
-        sweep = df["sig_sweep"]
-        confirm = df["sig_engulfing"] + df["sig_pinbar"]
-        bull = ((sweep == 1) | (sweep.shift(1) == 1)) & (confirm > 0)
-        bear = ((sweep == -1) | (sweep.shift(1) == -1)) & (confirm < 0)
-        df["sig_sweep_reversal"] = np.where(bull, 1, np.where(bear, -1, 0))
+        # sweep = df["sig_sweep"]
+        # confirm = df["sig_engulfing"] + df["sig_pinbar"]
+        # bull = ((sweep == 1) | (sweep.shift(1) == 1)) & (confirm > 0)
+        # bear = ((sweep == -1) | (sweep.shift(1) == -1)) & (confirm < 0)
+        # df["sig_sweep_reversal"] = np.where(bull, 1, np.where(bear, -1, 0))
 
         # --- Super confluence: fresh structure break + everything agrees ---
-        break_evt = df["sig_bos"] + df["sig_choch"]
-        vol_ok = df["volume_ratio"] > 1.2
-        df["sig_super_confluence"] = np.where(
-            (break_evt == 1) & (df["trend_score"] >= 3) & vol_ok, 1,
-            np.where((break_evt == -1) & (df["trend_score"] <= -3) & vol_ok, -1, 0),
-        )
+        # break_evt = df["sig_bos"] + df["sig_choch"]
+        # vol_ok = df["volume_ratio"] > 1.2
+        # df["sig_super_confluence"] = np.where(
+        #     (break_evt == 1) & (df["trend_score"] >= 3) & vol_ok, 1,
+        #     np.where((break_evt == -1) & (df["trend_score"] <= -3) & vol_ok, -1, 0),
+        # )
         return self

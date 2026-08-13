@@ -100,6 +100,77 @@ def simulate_trades(
     return trades, equity
 
 
+def simulate_trades_mfe_mae(sig, open_, high, low, close, take_profit_pct, stop_loss_pct, max_hold_bars):
+    """Diagnostic sibling of simulate_trades(): for every signal fire, walks the
+    full max_hold_bars window unconditionally (ignoring the fixed bracket) and
+    records how far price actually moved - max favorable excursion (mfe_pct),
+    max adverse excursion (mae_pct), and the close-of-window move (final_pct) -
+    plus whether the fixed target would have been touched before the fixed
+    stop (target_hit, same stop-wins-ties convention as simulate_trades).
+
+    Lets a condition's real directional edge (final_pct > 0) be measured
+    separately from whatever fixed TP/SL bracket happens to be configured -
+    a condition can be directionally right most of the time yet still show a
+    mediocre win rate purely because the fixed target sits farther than its
+    typical move. Same no-lookahead entry (next candle's open) and
+    non-overlapping-window consumption as simulate_trades, so trade
+    counts/timing line up 1:1 with the real backtest."""
+    n = len(open_)
+    rows = []
+
+    i = 0
+    while i < n - 1:
+        direction = sig[i]
+        if direction == 0:
+            i += 1
+            continue
+
+        entry_i = i + 1  # act on the NEXT candle's open - no lookahead
+        if entry_i >= n:
+            break
+        entry_price = open_[entry_i]
+        exit_bound = min(entry_i + max_hold_bars, n - 1)
+
+        mfe_pct = 0.0
+        mae_pct = 0.0
+        target_touched_i = None
+        stop_touched_i = None
+
+        for j in range(entry_i, exit_bound + 1):
+            if direction == 1:
+                fav_pct = (high[j] - entry_price) / entry_price * 100
+                adv_pct = (entry_price - low[j]) / entry_price * 100
+            else:
+                fav_pct = (entry_price - low[j]) / entry_price * 100
+                adv_pct = (high[j] - entry_price) / entry_price * 100
+
+            mfe_pct = max(mfe_pct, fav_pct)
+            mae_pct = max(mae_pct, adv_pct)
+
+            if target_touched_i is None and fav_pct >= take_profit_pct:
+                target_touched_i = j
+            if stop_touched_i is None and adv_pct >= stop_loss_pct:
+                stop_touched_i = j
+
+        final_pct = (close[exit_bound] - entry_price) / entry_price * 100 * direction
+        # stop wins same-candle ties, matching simulate_trades' convention
+        target_hit = target_touched_i is not None and (
+            stop_touched_i is None or target_touched_i < stop_touched_i
+        )
+
+        rows.append({
+            "direction": direction,
+            "mfe_pct": mfe_pct,
+            "mae_pct": mae_pct,
+            "final_pct": final_pct,
+            "target_hit": target_hit,
+        })
+
+        i = exit_bound + 1  # no overlapping windows, matches simulate_trades
+
+    return rows
+
+
 class Backtester:
     """Backtests every sig_* column independently against a fixed starting balance.
 

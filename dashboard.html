@@ -255,6 +255,28 @@
       <div id="combo-table-container"></div>
     </section>
 
+    <section class="tab" data-tab="indicators">
+      <h2>Indicator contribution</h2>
+      <p class="note">How often each base indicator/signal appears across every profitable combo, and its "lift" - how much a combo's total PnL differs from the overall average when that indicator is present. High appearance + positive lift = a real driver. High appearance + negative (or ~0) lift = along for the ride, not actually helping.</p>
+      <div class="cards" id="ind-summary-cards"></div>
+      <h2>Top / bottom 15 by lift</h2>
+      <div class="panel chart-panel" id="ind-lift-chart"></div>
+      <h2>Contribution table</h2>
+      <div id="ind-contribution-container"></div>
+
+      <h2>Possibly redundant indicator pairs</h2>
+      <p class="note">Numeric indicator pairs correlated at |r| &gt;= 0.9 (e.g. RSI_7 vs RSI_14) - the search space carries less independent signal than the raw column count suggests.</p>
+      <div id="ind-redundancy-container"></div>
+
+      <h2>Perfect-predictor scan (100% win rate)</h2>
+      <p class="note">Every combo that hit a literal 100% win rate, ranked by a Wilson-score confidence lower bound (not the raw 100%) so a 9-trade fluke doesn't read the same as an 80-trade result. Reliability also factors in combo size - deeper combos (more ANDed conditions) are inherently more overfit-prone.</p>
+      <div id="ind-perfect-container"></div>
+
+      <h2>Direction-right-but-target-missed diagnostic</h2>
+      <p class="note">Our backtest uses a FIXED take-profit/stop-loss bracket. A condition can correctly predict direction (directional_accuracy%) far more often than it actually hits that fixed target (target_hit_rate%) - the gap is exactly "direction was right, fixed target missed it." suggested_tp%/suggested_sl% are the condition's own median favorable/adverse move size - a data-driven bracket instead of the fixed one. Sort by gap% to see where the fixed bracket is failing worst.</p>
+      <div id="ind-target-container"></div>
+    </section>
+
     <section class="tab" data-tab="finalbacktest">
       <h2>Final backtest</h2>
       <p class="note" id="fb-intro">Pick one Long strategy and one Short strategy (defaults to whichever has the highest total PnL on each side) - the result below is ONE combined, single-account backtest: when the Long strategy's signal fires it takes a long trade, when the Short strategy's signal fires it takes a short trade, both on the same equity curve. Run <code>python3 finalbacktesting.py</code> to (re)generate this data.</p>
@@ -652,11 +674,115 @@
   }
 
   // ------------------------------------------------------------------
+  // Server-paginated/sorted/searched table - same look as renderDataTable,
+  // but for datasets too large to ship to the browser whole (the combos
+  // table can be 600k+ rows). opts.fetchPage(state) -> Promise<{rows, total}>
+  // is called on every sort/page/search change instead of slicing an
+  // in-memory array. opts.extraState (optional) is merged into the state
+  // object handed to fetchPage - used to also carry the filter-toolbar
+  // state alongside this table's own sort/page/search state.
+  // ------------------------------------------------------------------
+  function renderRemoteDataTable(container, columns, opts) {
+    opts = opts || {};
+    var pageSize = opts.pageSize || 50;
+    var state = { sortKey: opts.defaultSort || columns[0].key, sortDir: opts.defaultDir || "desc", page: 0, search: "" };
+    var searchDebounce = null;
+    var requestSeq = 0;
+
+    function load() {
+      var mySeq = ++requestSeq;
+      var fullState = Object.assign({}, state, opts.extraState ? opts.extraState() : {});
+      Promise.resolve(opts.fetchPage(fullState)).then(function (result) {
+        if (mySeq !== requestSeq) return; // a newer request already superseded this one
+        draw(result.rows || [], result.total || 0);
+      });
+    }
+
+    function draw(rows, total) {
+      container.innerHTML = "";
+
+      var toolbar = el("div", { class: "toolbar" });
+      if (opts.searchable !== false) {
+        var search = el("input", { type: "text", placeholder: "Filter rows..." });
+        search.value = state.search;
+        search.addEventListener("input", function (e) {
+          var value = e.target.value;
+          clearTimeout(searchDebounce);
+          searchDebounce = setTimeout(function () {
+            state.search = value;
+            state.page = 0;
+            load();
+          }, 300);
+        });
+        toolbar.appendChild(search);
+      }
+      var totalPages = Math.max(1, Math.ceil(total / pageSize));
+      var count = el("div", { class: "count" }, [total.toLocaleString() + " rows"]);
+      toolbar.appendChild(count);
+      container.appendChild(toolbar);
+
+      var table = el("table");
+      var thead = el("thead");
+      var headRow = el("tr");
+      columns.forEach(function (col) {
+        var th = el("th", { class: col.text ? "text" : "" }, [col.label]);
+        if (col.key === state.sortKey) {
+          th.classList.add("sorted");
+          th.textContent = col.label + (state.sortDir === "asc" ? " ↑" : " ↓");
+        }
+        th.addEventListener("click", function () {
+          if (state.sortKey === col.key) {
+            state.sortDir = state.sortDir === "asc" ? "desc" : "asc";
+          } else {
+            state.sortKey = col.key;
+            state.sortDir = "desc";
+          }
+          state.page = 0;
+          load();
+        });
+        headRow.appendChild(th);
+      });
+      thead.appendChild(headRow);
+      table.appendChild(thead);
+
+      var tbody = el("tbody");
+      rows.forEach(function (row) {
+        var tr = el("tr");
+        columns.forEach(function (col) {
+          var raw = row[col.key];
+          var display = col.format ? col.format(raw, row) : fmt(raw, col.digits);
+          var cls = col.text ? "text" : (col.colorize ? pctClass(raw) : "");
+          tr.appendChild(el("td", { class: cls }, [display]));
+        });
+        tbody.appendChild(tr);
+      });
+      table.appendChild(tbody);
+      container.appendChild(table);
+
+      var pagination = el("div", { class: "pagination" });
+      var prevBtn = el("button", {}, ["Prev"]);
+      prevBtn.disabled = state.page === 0;
+      prevBtn.addEventListener("click", function () { state.page -= 1; load(); });
+      var nextBtn = el("button", {}, ["Next"]);
+      nextBtn.disabled = state.page >= totalPages - 1;
+      nextBtn.addEventListener("click", function () { state.page += 1; load(); });
+      pagination.appendChild(prevBtn);
+      pagination.appendChild(el("span", {}, ["Page " + (state.page + 1) + " / " + totalPages]));
+      pagination.appendChild(nextBtn);
+      container.appendChild(pagination);
+    }
+
+    load();
+    return { reload: function () { state.page = 0; load(); } };
+  }
+
+  // ------------------------------------------------------------------
   // Tab navigation
   // ------------------------------------------------------------------
   var TABS = [
     { key: "overview", label: "Overview" },
     { key: "combos", label: "Combo Backtest" },
+    { key: "indicators", label: "Indicators" },
     { key: "finalbacktest", label: "Final Backtest" },
   ];
 
@@ -722,42 +848,26 @@
       " indicator, " + priceActionCols.length + " price-action columns.";
   }
 
-  // report.json ships combos compacted: each combo's "conditions" is a list of
-  // small integer indices into report.combo_backtest.condition_dictionary,
-  // not the full joined string (which can be 500+ characters for a large
-  // combo, and every profitable combo is now exported, not just a top-N
-  // slice) - reconstruct the display string here instead.
-  function directionLabel(d) {
-    return d === 1 || d === "Long" ? "Long" : (d === -1 || d === "Short" ? "Short" : String(d));
+  // Combos live server-side now (can be 600k+ rows - too many to ship to the
+  // browser whole, which is exactly what made the old dashboard never load).
+  // The filter toolbar just tracks state and asks the table/charts to
+  // re-fetch from /api/combos and /api/combos/chart with that state as query
+  // params, instead of filtering an in-memory array.
+  function comboFilterParams(state) {
+    var params = new URLSearchParams();
+    if (state.direction && state.direction !== "all") params.set("direction", state.direction === "long" ? "Long" : "Short");
+    if (state.minSize !== "") params.set("min_size", state.minSize);
+    if (state.maxSize !== "") params.set("max_size", state.maxSize);
+    if (state.minTrades !== "") params.set("min_trades", state.minTrades);
+    if (state.minWinRate !== "") params.set("min_winrate", state.minWinRate);
+    return params;
   }
 
-  function comboLabel(dictionary, row) {
-    return (row.conditions || []).map(function (i) { return dictionary[i]; }).join(" AND ");
-  }
-
-  // Filter toolbar (direction / size range / min trades / min win rate) -
-  // shared by the table, bar chart, and scatter chart below it, so all three
-  // views always agree on what's currently in scope.
-  function renderComboFilters(container, allCombos, onChange) {
+  function renderComboFilters(container, onChange) {
     container.innerHTML = "";
-    var sizes = allCombos.map(function (r) { return r.size; });
-    var sizeMin = sizes.length ? Math.min.apply(null, sizes) : "";
-    var sizeMax = sizes.length ? Math.max.apply(null, sizes) : "";
-
     var state = { direction: "all", minSize: "", maxSize: "", minTrades: "", minWinRate: "" };
 
-    function apply() {
-      var filtered = allCombos.filter(function (r) {
-        if (state.direction !== "all" && r.directionText.toLowerCase() !== state.direction) return false;
-        if (state.minSize !== "" && r.size < Number(state.minSize)) return false;
-        if (state.maxSize !== "" && r.size > Number(state.maxSize)) return false;
-        if (state.minTrades !== "" && r.trades < Number(state.minTrades)) return false;
-        if (state.minWinRate !== "" && r.win_rate_pct < Number(state.minWinRate)) return false;
-        return true;
-      });
-      countEl.textContent = filtered.length.toLocaleString() + " of " + allCombos.length.toLocaleString() + " combos match";
-      onChange(filtered);
-    }
+    function apply() { onChange(state); }
 
     var dirGroup = el("div", { class: "filter-group" });
     [["all", "All"], ["long", "Long"], ["short", "Short"]].forEach(function (pair) {
@@ -785,53 +895,54 @@
       apply();
     });
 
-    var countEl = el("div", { class: "filter-count" }, [""]);
-
     container.appendChild(el("div", { class: "filters-toolbar" }, [
       dirGroup,
-      numberInput("Min size", "minSize", sizeMin),
-      numberInput("Max size", "maxSize", sizeMax),
+      numberInput("Min size", "minSize"),
+      numberInput("Max size", "maxSize"),
       numberInput("Min trades", "minTrades", 0),
       numberInput("Min win rate%", "minWinRate", 0),
       resetBtn,
-      countEl,
     ]));
 
     apply();
   }
 
-  function renderComboViews(combos) {
-    var topCombos = combos.slice(0, 10).map(function (r) { return { label: "[" + r.directionText + "] " + r.comboText, value: r.total_pnl }; });
-    renderBarChart(document.getElementById("combo-bar-chart"), topCombos, {
-      valueFormat: function (v) { return (v >= 0 ? "+" : "") + fmt(v, 2); },
+  function fetchComboChart(state, kind) {
+    var params = comboFilterParams(state);
+    params.set("kind", kind);
+    return fetch("/api/combos/chart?" + params.toString()).then(function (r) { return r.json(); });
+  }
+
+  function renderComboViews(filterState) {
+    fetchComboChart(filterState, "bar").then(function (data) {
+      var items = (data.points || []).map(function (p) { return { label: p.label, value: p.value }; });
+      renderBarChart(document.getElementById("combo-bar-chart"), items, {
+        valueFormat: function (v) { return (v >= 0 ? "+" : "") + fmt(v, 2); },
+      });
     });
 
-    var scatterPoints = combos.map(function (r) {
-      return {
-        x: r.win_rate_pct,
-        y: r.return_pct,
-        color: r.directionText === "Long" ? "var(--green)" : "var(--red)",
-        label: "[" + r.directionText + "] " + r.comboText,
-        meta: "win_rate " + fmt(r.win_rate_pct, 1) + "% • return " + (r.return_pct >= 0 ? "+" : "") + fmt(r.return_pct, 1) +
-          "% • " + r.trades + " trades • size " + r.size,
-      };
-    });
-    renderScatterChart(document.getElementById("combo-scatter-chart"), scatterPoints, {
-      xLabel: "win rate %",
-      yLabel: "return %",
-      itemNoun: "combos",
-      legend: [
-        { color: "var(--green)", label: "Long" },
-        { color: "var(--red)", label: "Short" },
-      ],
+    fetchComboChart(filterState, "scatter").then(function (data) {
+      var scatterPoints = (data.points || []).map(function (p) {
+        return {
+          x: p.x, y: p.y,
+          color: p.direction === "Long" ? "var(--green)" : "var(--red)",
+          label: p.label,
+          meta: "win_rate " + fmt(p.x, 1) + "% • return " + (p.y >= 0 ? "+" : "") + fmt(p.y, 1) +
+            "% • " + p.trades + " trades • size " + p.size,
+        };
+      });
+      renderScatterChart(document.getElementById("combo-scatter-chart"), scatterPoints, {
+        xLabel: "win rate %", yLabel: "return %", itemNoun: "combos",
+        legend: [{ color: "var(--green)", label: "Long" }, { color: "var(--red)", label: "Short" }],
+        maxPoints: data.points ? data.points.length + 1 : 2000, // already sampled server-side
+      });
+      var titleEl = document.getElementById("combo-table-title");
+      titleEl.textContent = (data.total || 0).toLocaleString() + " combination" + (data.total === 1 ? "" : "s");
     });
 
-    var titleEl = document.getElementById("combo-table-title");
-    titleEl.textContent = combos.length.toLocaleString() + " combination" + (combos.length === 1 ? "" : "s");
-
-    renderDataTable(document.getElementById("combo-table-container"), combos, [
-      { key: "directionText", label: "Dir" },
-      { key: "comboText", label: "Combo", text: true },
+    renderRemoteDataTable(document.getElementById("combo-table-container"), [
+      { key: "direction", label: "Dir" },
+      { key: "combo", label: "Combo", text: true },
       { key: "size", label: "size" },
       { key: "fires", label: "fires" },
       { key: "trades", label: "trades" },
@@ -839,19 +950,28 @@
       { key: "final_equity", label: "final_$", format: function (v) { return fmt(v, 2); } },
       { key: "total_pnl", label: "total_pnl", format: function (v) { return fmt(v, 2); }, colorize: true },
       { key: "return_pct", label: "return%", format: function (v) { return fmt(v, 1); }, colorize: true },
-    ], { defaultSort: "total_pnl", defaultDir: "desc" });
+    ], {
+      defaultSort: "total_pnl", defaultDir: "desc",
+      extraState: function () { return { filters: filterState }; },
+      fetchPage: function (state) {
+        var params = comboFilterParams(state.filters);
+        params.set("sort", state.sortKey);
+        params.set("dir", state.sortDir);
+        params.set("page", state.page);
+        if (state.search) params.set("search", state.search);
+        return fetch("/api/combos?" + params.toString()).then(function (r) { return r.json(); });
+      },
+    });
   }
 
-  function renderCombo(report) {
-    var cb = report.combo_backtest;
+  function renderCombo(summary) {
     var cfgContainer = document.getElementById("combo-config-cards");
-    if (!cb) {
+    var cfg = summary.combo_config;
+    if (!cfg) {
       cfgContainer.appendChild(el("p", { class: "note" }, ["Combo backtest was not run."]));
       return;
     }
 
-    var cfg = cb.config;
-    var dictionary = cb.condition_dictionary || [];
     var pairs = [
       ["Combo sizes", cfg.min_combo_size + " - " + cfg.max_combo_size],
       ["Min fires", cfg.min_fires],
@@ -868,17 +988,13 @@
       ]));
     });
 
-    var combos = (cb.combinations || []).map(function (r) {
-      return Object.assign({}, r, { comboText: comboLabel(dictionary, r), directionText: directionLabel(r.direction) });
-    });
-
     var calloutContainer = document.getElementById("combo-best-callout");
-    var initialCapital = (report.config && report.config.backtest_initial_capital) || 100;
-    if (combos.length) {
-      var best = combos[0];
+    var initialCapital = (summary.config && summary.config.backtest_initial_capital) || 100;
+    var best = summary.best_combo;
+    if (best) {
       calloutContainer.appendChild(el("div", {}, [
         el("strong", {}, ["Best combination (max profit / capital growth): "]),
-        "[" + best.directionText + "] " + best.comboText + " — $" + fmt(initialCapital, 0) + " grew to $" + fmt(best.final_equity, 2) +
+        "[" + best.direction + "] " + best.combo + " — $" + fmt(initialCapital, 0) + " grew to $" + fmt(best.final_equity, 2) +
           " (" + (best.return_pct >= 0 ? "+" : "") + fmt(best.return_pct, 1) + "%) over " + best.trades +
           " trades, " + fmt(best.win_rate_pct, 1) + "% win rate.",
       ]));
@@ -886,7 +1002,79 @@
       calloutContainer.appendChild(el("div", {}, ["No profitable combination found."]));
     }
 
-    renderComboFilters(document.getElementById("combo-filters"), combos, renderComboViews);
+    renderComboFilters(document.getElementById("combo-filters"), renderComboViews);
+  }
+
+  // ------------------------------------------------------------------
+  // Indicators tab
+  // ------------------------------------------------------------------
+  function renderIndicators(data) {
+    var contribution = data.contribution || { rows: [], overall_mean_pnl: 0, total_combos: 0 };
+    var summaryContainer = document.getElementById("ind-summary-cards");
+    [
+      ["Indicators/signals tracked", contribution.rows.length],
+      ["Profitable combos analyzed", (contribution.total_combos || 0).toLocaleString()],
+      ["Overall mean PnL per combo", "$" + fmt(contribution.overall_mean_pnl, 2)],
+      ["Redundant pairs (|r|>=0.9)", (data.redundancy || []).length],
+    ].forEach(function (pair) {
+      summaryContainer.appendChild(el("div", { class: "card" }, [
+        el("div", { class: "label" }, [pair[0]]),
+        el("div", { class: "value" }, [String(pair[1])]),
+      ]));
+    });
+
+    var bySignedLift = contribution.rows.slice().sort(function (a, b) { return b.lift_vs_overall_mean - a.lift_vs_overall_mean; });
+    var top15 = bySignedLift.slice(0, 15);
+    var bottom15 = bySignedLift.slice(-15).reverse();
+    var liftItems = top15.concat(bottom15).map(function (r) {
+      return { label: r.name, value: r.lift_vs_overall_mean };
+    });
+    renderBarChart(document.getElementById("ind-lift-chart"), liftItems, {
+      valueFormat: function (v) { return (v >= 0 ? "+$" : "-$") + fmt(Math.abs(v), 2); },
+    });
+
+    renderDataTable(document.getElementById("ind-contribution-container"), contribution.rows, [
+      { key: "name", label: "Name", text: true },
+      { key: "kind", label: "Type", text: true },
+      { key: "appears_in", label: "Appears in" },
+      { key: "pct_of_profitable_combos", label: "% of combos", format: function (v) { return fmt(v, 2) + "%"; } },
+      { key: "mean_pnl_when_present", label: "Avg PnL present", format: function (v) { return fmt(v, 2); } },
+      { key: "lift_vs_overall_mean", label: "Lift", format: function (v) { return (v >= 0 ? "+" : "") + fmt(v, 2); }, colorize: true },
+    ], { defaultSort: "appears_in", defaultDir: "desc" });
+
+    renderDataTable(document.getElementById("ind-redundancy-container"), data.redundancy || [], [
+      { key: "a", label: "Indicator A", text: true },
+      { key: "b", label: "Indicator B", text: true },
+      { key: "correlation", label: "Correlation", format: function (v) { return fmt(v, 3); } },
+    ], { defaultSort: "correlation", defaultDir: "desc" });
+
+    var pp = data.perfect_predictors || [];
+    if (!pp.length) {
+      document.getElementById("ind-perfect-container").appendChild(
+        el("p", { class: "note" }, ["No combo achieved a literal 100% win rate in this run - expected/healthy given realistic fees and finite sample sizes, not a bug."])
+      );
+    } else {
+      renderDataTable(document.getElementById("ind-perfect-container"), pp, [
+        { key: "direction", label: "Dir" },
+        { key: "combo", label: "Combo", text: true },
+        { key: "size", label: "size" },
+        { key: "trades", label: "trades" },
+        { key: "total_pnl", label: "total_pnl", format: function (v) { return fmt(v, 2); }, colorize: true },
+        { key: "wilson_lower_bound_pct", label: "Wilson LB%", format: function (v) { return fmt(v, 1); } },
+        { key: "reliability", label: "Reliability", text: true },
+      ], { defaultSort: "wilson_lower_bound_pct", defaultDir: "desc" });
+    }
+
+    renderDataTable(document.getElementById("ind-target-container"), data.direction_target_diagnostic || [], [
+      { key: "condition", label: "Condition", text: true },
+      { key: "direction", label: "Dir" },
+      { key: "trades", label: "trades" },
+      { key: "directional_accuracy_pct", label: "Direction right %", format: function (v) { return fmt(v, 1); } },
+      { key: "target_hit_rate_pct", label: "Target hit %", format: function (v) { return fmt(v, 1); } },
+      { key: "gap_pct", label: "Gap %", format: function (v) { return fmt(v, 1); }, colorize: true },
+      { key: "suggested_tp_pct", label: "Suggested TP%", format: function (v) { return fmt(v, 3); } },
+      { key: "suggested_sl_pct", label: "Suggested SL%", format: function (v) { return fmt(v, 3); } },
+    ], { defaultSort: "gap_pct", defaultDir: "desc" });
   }
 
   // ------------------------------------------------------------------
@@ -1068,13 +1256,18 @@
   }
 
   // ------------------------------------------------------------------
-  // Boot
+  // Boot - everything now comes from ui.py's Flask API, not a raw fetch of
+  // report.json (which can be 100+ MB with the full combo search - that's
+  // what made the old file:// dashboard never load). Only /api/summary and
+  // /api/indicators are fetched up front (both small); the combos tab and
+  // its charts fetch on demand from /api/combos and /api/combos/chart.
   // ------------------------------------------------------------------
-  function init(report, fbData) {
-    REPORT = report;
+  function init(summary, indicators, fbData) {
+    REPORT = summary;
     setupNav();
-    renderOverview(report);
-    renderCombo(report);
+    renderOverview(summary);
+    renderCombo(summary);
+    renderIndicators(indicators || { rows: [] });
     renderFinalBacktest(fbData);
     document.getElementById("app").style.display = "block";
   }
@@ -1083,28 +1276,24 @@
     var box = document.getElementById("error-box");
     box.style.display = "block";
     box.innerHTML =
-      "<h2>Could not load report.json</h2>" +
+      "<h2>Could not load the dashboard data</h2>" +
       "<p>" + message + "</p>" +
-      "<p>If you opened this file directly by double-clicking it, your browser blocks local JSON fetches " +
-      "for security reasons (file:// CORS restriction). Run this project's report first if you haven't, then " +
-      "serve this folder over http instead of opening the file directly:</p>" +
-      "<pre>python3 -m http.server 8000</pre>" +
-      "<p>Then open <code>http://localhost:8000/dashboard.html</code> in your browser.</p>";
+      "<p>This dashboard is served by ui.py now (report.json is too large for a browser to fetch directly). " +
+      "From the project folder, run:</p>" +
+      "<pre>python3 ui.py</pre>" +
+      "<p>Then open <code>http://127.0.0.1:5000</code> - and make sure <code>report.json</code> exists " +
+      "(run <code>python3 main.py</code> first if it doesn't).</p>";
   }
 
-  // final_backtest_data.json is optional (only exists once you've run
-  // finalbacktesting.py) - fetched independently so its absence never blocks
-  // the rest of the dashboard from loading.
   Promise.all([
-    fetch("report.json").then(function (response) {
-      if (!response.ok) throw new Error("HTTP " + response.status);
-      return response.json();
-    }),
-    fetch("final_backtest_data.json")
-      .then(function (response) { return response.ok ? response.json() : null; })
-      .catch(function () { return null; }),
+    fetch("/api/summary").then(function (r) { return r.json(); }),
+    fetch("/api/indicators").then(function (r) { return r.json(); }),
+    fetch("/api/final_backtest").then(function (r) { return r.json(); }).catch(function () { return null; }),
   ])
-    .then(function (results) { init(results[0], results[1]); })
+    .then(function (results) {
+      if (results[0] && results[0].error) throw new Error(results[0].error);
+      init(results[0], results[1], results[2]);
+    })
     .catch(function (err) { showError(err.message); });
 })();
 </script>

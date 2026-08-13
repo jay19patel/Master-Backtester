@@ -3,6 +3,8 @@ exhaustively combo-backtest every indicator condition crossed with every
 price-action signal and report the top combinations by real PnL.
 """
 
+import os
+import time
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -20,7 +22,7 @@ pd.set_option("display.width", 200)
 
 SYMBOL = "ETHUSD"
 INTERVAL = "15m"
-TOTAL_DAYS = 600
+TOTAL_DAYS = 365
 
 INCLUDE_INDICATORS = True
 # Largest indicator window is 100 bars (EMA_100/SMA_100); need more history than that.
@@ -29,7 +31,7 @@ MIN_INDICATOR_BARS = 150
 BACKTEST_INITIAL_CAPITAL = 1000.0
 BACKTEST_RISK_PER_TRADE_PCT = 2.0
 BACKTEST_STOP_LOSS_PCT = 1  # 1% stop-loss
-BACKTEST_TAKE_PROFIT_PCT = 3  # 3% target -> 1:3 reward:risk
+BACKTEST_TAKE_PROFIT_PCT = 2  # 3% target -> 1:3 reward:risk
 BACKTEST_MAX_HOLD_BARS = 20
 BACKTEST_FEE_PCT = 0.05
 
@@ -38,6 +40,10 @@ COMBO_MIN_SIZE = 3
 # Ceiling on combo size - search stops early on its own once nothing clears COMBO_MIN_FIRES.
 COMBO_MAX_SIZE = 100
 COMBO_MIN_FIRES = 15
+# Multi-candle patterns: every condition also gets a "k candles ago" copy at
+# each depth here (e.g. a big mother candle 2 bars back + inside bar 1 bar
+# back + breakout now), not just conditions that all fire on the same candle.
+COMBO_LAG_DEPTHS = (1, 2, 3)
 COMBO_CONSOLE_TOP_N = 20
 COMBO_N_WORKERS = None  # None = every CPU core minus one
 COMBO_MAX_RAW_CANDIDATES_PER_LEVEL = 20_000_000
@@ -103,6 +109,7 @@ def print_report(df):
 
 
 def main():
+    run_start = time.monotonic()
     df = build_dataset()
     print_report(df)
 
@@ -120,6 +127,7 @@ def main():
             min_combo_size=COMBO_MIN_SIZE,
             max_combo_size=COMBO_MAX_SIZE,
             min_fires=COMBO_MIN_FIRES,
+            lag_depths=COMBO_LAG_DEPTHS,
             console_top_n=COMBO_CONSOLE_TOP_N,
             n_workers=COMBO_N_WORKERS,
             max_raw_candidates_per_level=COMBO_MAX_RAW_CANDIDATES_PER_LEVEL,
@@ -129,8 +137,35 @@ def main():
         precomputed["combo_backtester"] = combo_bt
         precomputed["combo_profitable"] = combo_bt.print_report()
 
+    output_paths = []
     if RUN_JSON_EXPORT:
         ReportExporter(df, export_config(), precomputed=precomputed).save(JSON_EXPORT_PATH)
+        output_paths.append(JSON_EXPORT_PATH)
+
+    print_run_summary(run_start, df, precomputed, output_paths)
+
+
+def print_run_summary(run_start, df, precomputed, output_paths):
+    """Short end-of-run summary: total time, row/column counts, where the
+    output landed. The detailed combo breakdown lives in report.json / the
+    ui.py dashboard, not the console."""
+    console = Console(width=220)
+    elapsed = time.monotonic() - run_start
+
+    console.print("\n[bold]RUN SUMMARY[/bold]")
+    console.print(f"Total time          : {elapsed:.1f}s")
+    console.print(f"Dataset             : {len(df):,} rows x {len(df.columns)} columns ({SYMBOL} {INTERVAL})")
+
+    profitable = precomputed.get("combo_profitable")
+    if profitable is not None and not profitable.empty:
+        console.print(f"Profitable combos   : {len(profitable):,} (best PnL: ${profitable.iloc[0]['total_pnl']:+.2f})")
+
+    for path in output_paths:
+        if os.path.exists(path):
+            size_mb = os.path.getsize(path) / (1024 * 1024)
+            console.print(f"Saved               : {path} ({size_mb:.1f} MB)")
+
+    console.print("View results        : run `python3 ui.py` and open http://127.0.0.1:5000")
 
 
 def export_config():
@@ -150,6 +185,7 @@ def export_config():
         "combo_min_size": COMBO_MIN_SIZE,
         "combo_max_size": COMBO_MAX_SIZE,
         "combo_min_fires": COMBO_MIN_FIRES,
+        "combo_lag_depths": list(COMBO_LAG_DEPTHS),
     }
 
 
