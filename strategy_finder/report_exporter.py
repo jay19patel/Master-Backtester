@@ -1,5 +1,5 @@
 """ReportExporter: runs the combo backtest (if not already computed) and writes
-a single JSON file that the ui/ Streamlit app reads and renders.
+a single JSON file with the full combo search results.
 
 Usage:
     ReportExporter(df, config).save("data/report.json")
@@ -47,8 +47,8 @@ def _json_safe(value):
 def compact_combo_records(df):
     """Every combo, compacted: condition/signal names dedup into one
     `condition_dictionary` array, each combo stores integer indices into it
-    instead of a repeated " AND "-joined string - the display string is
-    reconstructed on read (ui/app.py, backtesting/strategy_runner.py)."""
+    instead of a repeated " AND "-joined string, keeping data/report.json
+    much smaller for the same combo count."""
     if df is None or len(df) == 0:
         return [], []
 
@@ -168,7 +168,7 @@ class ReportExporter:
 
     def save(self, path="data/report.json"):
         """Compact JSON (no indent) - this file can be hundreds of MB with the
-        full combo search, and it's read by the ui/ Streamlit app, not by hand."""
+        full combo search, not meant to be read by hand."""
         report = self.build()
         with open(path, "w") as f:
             json.dump(report, f, default=_json_safe)

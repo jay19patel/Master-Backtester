@@ -22,10 +22,11 @@ loses no reachable result.
 
 Apriori-style level-wise search: size-k combos only extend size-(k-1) combos
 that already cleared `min_fires`. Size-1 conditions are simulated immediately
-to get a real standalone `total_pnl` as a quality score. When a level's
-survivor count exceeds `max_survivors_per_level`, only the top-scoring combos
+to get a real standalone `total_pnl` as a quality score. `max_survivors_per_level`
+and `max_raw_candidates_per_level` are optional (None = no cap, fully
+exhaustive); when set and a level exceeds them, only the top-scoring combos
 (by summed member quality score) continue - never random - reported via
-`trimmed_levels` so it's never mistaken for exhaustive.
+`trimmed_levels` so a capped run is never mistaken for exhaustive.
 
 Performance: every phase (warm-up simulation, candidate extension, fire-count
 prefilter, trade simulation) runs across a process pool (`n_workers`). Pool
@@ -159,12 +160,11 @@ class ComboBacktester:
         min_combo_size=1,
         max_combo_size=8,
         min_fires=15,
-        console_top_n=20,
         condition_window=100,
         lag_depths=(1, 2, 3),
         n_workers=None,
-        max_raw_candidates_per_level=20_000_000,
-        max_survivors_per_level=20_000,
+        max_raw_candidates_per_level=None,
+        max_survivors_per_level=None,
         max_search_seconds=None,
     ):
         self.df = df
@@ -177,12 +177,12 @@ class ComboBacktester:
         self.min_combo_size = min_combo_size
         self.max_combo_size = max_combo_size
         self.min_fires = min_fires
-        self.console_top_n = console_top_n
         self.condition_window = condition_window
         self.lag_depths = tuple(lag_depths)
         self.n_workers = n_workers or max(1, (os.cpu_count() or 2) - 1)  # leave a core free
-        # Safety nets: raw-candidate ceiling, survivors-per-level cap, optional
-        # time budget. Whichever trips first, combos already found are kept.
+        # Optional safety nets: raw-candidate ceiling, survivors-per-level cap,
+        # time budget - each None by default (no cap, fully exhaustive search).
+        # Whichever trips first (if set), combos already found are kept.
         self.max_raw_candidates_per_level = max_raw_candidates_per_level
         self.max_survivors_per_level = max_survivors_per_level
         self.max_search_seconds = max_search_seconds
@@ -356,7 +356,7 @@ class ComboBacktester:
                 # Exact count of extensions canonical ordering will try this level.
                 pool_size = len(names_list)
                 raw_estimate = sum(pool_size - name_rank[c[-1]] - 1 for c in current_combos)
-                if raw_estimate > self.max_raw_candidates_per_level:
+                if self.max_raw_candidates_per_level is not None and raw_estimate > self.max_raw_candidates_per_level:
                     trimmed_levels.append((direction, size, "raw_candidates", raw_estimate, self.max_raw_candidates_per_level, 0))
                     current_combos = []
                     break
@@ -402,15 +402,16 @@ class ComboBacktester:
                 tested += examined_total
 
                 original_count = len(survivors)
+                has_survivor_cap = self.max_survivors_per_level is not None
                 if time_budget_hit_mid_level:
                     # Partial level: real survivors, but not fully examined.
-                    if original_count > self.max_survivors_per_level:
+                    if has_survivor_cap and original_count > self.max_survivors_per_level:
                         survivors.sort(key=lambda item: combo_score(item[1]), reverse=True)
                         survivors = survivors[: self.max_survivors_per_level]
                     trimmed_levels.append(
                         (direction, size, "time_budget", original_count, self.max_search_seconds, len(survivors))
                     )
-                elif original_count > self.max_survivors_per_level:
+                elif has_survivor_cap and original_count > self.max_survivors_per_level:
                     survivors.sort(key=lambda item: combo_score(item[1]), reverse=True)
                     survivors = survivors[: self.max_survivors_per_level]
                     trimmed_levels.append(
@@ -577,7 +578,7 @@ class ComboBacktester:
             return profitable
 
         # Full breakdown (top combos, best-per-size, top win rate, indicator diagnostics)
-        # lives in data/report.json / the ui/ Streamlit app - console stays a short summary.
+        # lives in data/report.json - console stays a short summary.
         best = profitable.iloc[0]
         console.print(
             f"\n[bold]Best combo overall:[/bold] [{best['direction']}] {best['combo']} (size {best['size']}) -> "

@@ -44,14 +44,7 @@ COMBO_MIN_FIRES = 15
 # each depth here (e.g. a big mother candle 2 bars back + inside bar 1 bar
 # back + breakout now), not just conditions that all fire on the same candle.
 COMBO_LAG_DEPTHS = (1, 2, 3)
-COMBO_CONSOLE_TOP_N = 20
-COMBO_N_WORKERS = None  # None = every CPU core minus one
-COMBO_MAX_RAW_CANDIDATES_PER_LEVEL = 20_000_000
-# How many combos carry forward into the next size, per stage (size 1 always keeps all).
-COMBO_MAX_SURVIVORS_PER_LEVEL = 100000
-COMBO_MAX_SEARCH_SECONDS = None  # None = no wall-clock limit
 
-RUN_JSON_EXPORT = True
 JSON_EXPORT_PATH = "data/report.json"
 
 OHLCV_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
@@ -128,27 +121,25 @@ def main():
             max_combo_size=COMBO_MAX_SIZE,
             min_fires=COMBO_MIN_FIRES,
             lag_depths=COMBO_LAG_DEPTHS,
-            console_top_n=COMBO_CONSOLE_TOP_N,
-            n_workers=COMBO_N_WORKERS,
-            max_raw_candidates_per_level=COMBO_MAX_RAW_CANDIDATES_PER_LEVEL,
-            max_survivors_per_level=COMBO_MAX_SURVIVORS_PER_LEVEL,
-            max_search_seconds=COMBO_MAX_SEARCH_SECONDS,
+            n_workers=None,  # every CPU core minus one
+            max_raw_candidates_per_level=None,  # no ceiling, examine every candidate at every level
+            max_survivors_per_level=None,  # no cap, every combo that clears min_fires carries forward
+            max_search_seconds=None,  # no wall-clock limit
         )
         precomputed["combo_backtester"] = combo_bt
         precomputed["combo_profitable"] = combo_bt.print_report()
 
     output_paths = []
-    if RUN_JSON_EXPORT:
-        ReportExporter(df, export_config(), precomputed=precomputed).save(JSON_EXPORT_PATH)
-        output_paths.append(JSON_EXPORT_PATH)
+    ReportExporter(df, export_config(), precomputed=precomputed).save(JSON_EXPORT_PATH)
+    output_paths.append(JSON_EXPORT_PATH)
 
     print_run_summary(run_start, df, precomputed, output_paths)
 
 
 def print_run_summary(run_start, df, precomputed, output_paths):
     """Short end-of-run summary: total time, row/column counts, where the
-    output landed. The detailed combo breakdown lives in data/report.json /
-    the ui/ Streamlit app, not the console."""
+    output landed. The detailed combo breakdown lives in data/report.json,
+    not the console."""
     console = Console(width=220)
     elapsed = time.monotonic() - run_start
 
@@ -159,13 +150,17 @@ def print_run_summary(run_start, df, precomputed, output_paths):
     profitable = precomputed.get("combo_profitable")
     if profitable is not None and not profitable.empty:
         console.print(f"Profitable combos   : {len(profitable):,} (best PnL: ${profitable.iloc[0]['total_pnl']:+.2f})")
+        best = profitable.iloc[0]
+        console.print(
+            f"Best result         : ${BACKTEST_INITIAL_CAPITAL:,.0f} -> ${best['final_equity']:,.2f} "
+            f"({best['return_pct']:+.1f}%) using [{best['direction']}] {best['combo']} "
+            f"(size {best['size']}, {best['trades']} trades, {best['win_rate_pct']:.1f}% win rate)"
+        )
 
     for path in output_paths:
         if os.path.exists(path):
             size_mb = os.path.getsize(path) / (1024 * 1024)
             console.print(f"Saved               : {path} ({size_mb:.1f} MB)")
-
-    console.print("View results        : run `streamlit run ui/app.py`")
 
 
 def export_config():
