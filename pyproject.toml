@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "flask>=3.1.0",
     "numpy>=2.2.6",
     "pandas>=2.3.3",
     "pandas-ta>=0.4.71b0",
@@ -12,3 +13,13 @@ dependencies = [
     "rich>=15.0.0",
     "scipy>=1.18.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+

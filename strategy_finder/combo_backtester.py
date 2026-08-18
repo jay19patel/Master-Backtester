@@ -45,6 +45,7 @@ import pandas as pd
 from rich.console import Console
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
 
+from . import db as results_db
 from .backtester import simulate_trades
 
 OHLCV_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
@@ -265,12 +266,16 @@ class ComboBacktester:
     # ------------------------------------------------------------------
     # Search + backtest
     # ------------------------------------------------------------------
-    def _simulate_tasks(self, tasks, executor, progress, description, console=None, heartbeat_seconds=10):
+    def _simulate_tasks(self, tasks, executor, progress, description, console=None, heartbeat_seconds=10, persist=True):
         """Runs _evaluate_batch over `tasks` in parallel with a progress bar.
         Returns (rows, simulated_count). Shared by the size-1 warm-up pass and
-        the final simulation pass. If `console` is given, also prints a
-        permanent line every `heartbeat_seconds` (useful once redirected to a
-        log file, where the live bar shows nothing)."""
+        the final simulation pass. When `persist` is True, every batch's rows
+        are inserted into the SQLite results DB (results_db) as soon as that
+        batch finishes - so a crash or kill mid-run loses at most the one
+        in-flight batch, never the whole pass. `persist=False` is for combos
+        below `min_combo_size` (e.g. the size-1 quality-score warm-up when
+        min_combo_size > 1) - real trades, but not combos the run is meant to
+        report, so they must not end up mixed into the results table."""
         if not tasks:
             return [], 0
         chunk_size = max(50, len(tasks) // (self.n_workers * 8) or 1)
@@ -283,6 +288,8 @@ class ComboBacktester:
         last_print = start
         for chunk_idx, (chunk, (batch_rows, batch_simulated)) in enumerate(zip(chunks, executor.map(_evaluate_batch, chunks)), start=1):
             rows.extend(batch_rows)
+            if persist:
+                results_db.insert_results(batch_rows)
             simulated += batch_simulated
             done += len(chunk)
             progress.update(task_id, advance=len(chunk))
@@ -323,7 +330,8 @@ class ComboBacktester:
 
             size1_tasks = [(direction, (name,)) for name in names_list]
             size1_rows, size1_simulated = self._simulate_tasks(
-                size1_tasks, executor, progress, f"[{label}] size 1: simulating (quality scores)", console=console
+                size1_tasks, executor, progress, f"[{label}] size 1: simulating (quality scores)", console=console,
+                persist=(self.min_combo_size <= 1),
             )
             simulated_count += size1_simulated
             tested += len(size1_tasks)
@@ -447,6 +455,11 @@ class ComboBacktester:
         """Backtest every qualifying combination, at every size. Returns a
         DataFrame (both winning and losing combos that cleared min_fires),
         best PnL first."""
+        # Each run starts from a clean results table - only the latest run's
+        # combos are ever kept, and every row inserted from here on (see
+        # _simulate_tasks) is this run's, not a leftover from a previous one.
+        results_db.clear_results()
+
         long_pool, short_pool = self._build_pools()
         pools_by_direction = {1: long_pool, -1: short_pool}
 

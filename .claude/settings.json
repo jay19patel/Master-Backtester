@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(awk '{printf \"PID %s  RSS=%.0fMB  VSZ=%.0fMB  CPU%%=%s  TIME=%s\\\\n\", $2, $6/1024, $5/1024, $3, $10}')",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('strategy_finder/main.py'\\).read\\(\\)\\); ast.parse\\(open\\('strategy_finder/combo_backtester.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('strategy_finder/combo_backtester.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python3 -c ' *)",
+      "Bash(rm -f data/combo_results.db*)"
+    ]
+  }
+}

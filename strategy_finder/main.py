@@ -40,6 +40,13 @@ COMBO_MIN_SIZE = 3
 # Ceiling on combo size - search stops early on its own once nothing clears COMBO_MIN_FIRES.
 COMBO_MAX_SIZE = 100
 COMBO_MIN_FIRES = 15
+# Safety cap: at COMBO_MIN_FIRES=15 (~35k candles/year on 15m), the AND filter barely
+# prunes anything - size 2 already clears ~99.5% of all possible combos, size 3 ~97%,
+# so candidate counts explode combinatorially level over level with no cap (seen live:
+# size 3 -> 8.5M survivors, size 4 raw estimate -> 812M). Keeping only the top-scoring
+# (summed size-1 PnL) survivors per level bounds memory/time regardless of how
+# permissive COMBO_MIN_FIRES is - never a random cut, and reported via trimmed_levels.
+COMBO_MAX_SURVIVORS_PER_LEVEL = 200_000
 # Multi-candle patterns: every condition also gets a "k candles ago" copy at
 # each depth here (e.g. a big mother candle 2 bars back + inside bar 1 bar
 # back + breakout now), not just conditions that all fire on the same candle.
@@ -123,15 +130,22 @@ def main():
             lag_depths=COMBO_LAG_DEPTHS,
             n_workers=None,  # every CPU core minus one
             max_raw_candidates_per_level=None,  # no ceiling, examine every candidate at every level
-            max_survivors_per_level=None,  # no cap, every combo that clears min_fires carries forward
+            max_survivors_per_level=COMBO_MAX_SURVIVORS_PER_LEVEL,  # bounds runaway growth, see comment above
             max_search_seconds=None,  # no wall-clock limit
         )
         precomputed["combo_backtester"] = combo_bt
+        # Every combo is inserted into data/combo_results.db as it's computed
+        # (see ComboBacktester.run/_simulate_tasks) - by the time this call
+        # returns, results are already safely on disk regardless of what
+        # happens next. Browse them with `python3 -m strategy_finder.webapp`.
         precomputed["combo_profitable"] = combo_bt.print_report()
 
     output_paths = []
-    ReportExporter(df, export_config(), precomputed=precomputed).save(JSON_EXPORT_PATH)
-    output_paths.append(JSON_EXPORT_PATH)
+    try:
+        ReportExporter(df, export_config(), precomputed=precomputed).save(JSON_EXPORT_PATH)
+        output_paths.append(JSON_EXPORT_PATH)
+    except Exception as e:
+        print(f"[main] JSON report export failed ({e!r}) - combo results are still safe in data/combo_results.db.")
 
     print_run_summary(run_start, df, precomputed, output_paths)
 

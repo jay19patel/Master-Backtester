@@ -44,7 +44,8 @@ class IndicatorEngine:
     def _add_basic_features(self):
         df = self.df
 
-        df["close_return"] = np.log(df["Close"] / df["Close"].shift(1))
+        # close_return dropped: r=1.0 with return_1 (log vs simple return of the same
+        # single-bar move), no downstream use - return_1 is what everything else here uses
         df["return_1"] = df["Close"].pct_change()
         df["return_5"] = df["Close"].pct_change(5)
         df["return_10"] = df["Close"].pct_change(10)
@@ -67,20 +68,13 @@ class IndicatorEngine:
         df = self.df
 
         # EMA_5 dropped: 0.93-correlated with EMA_10, near-duplicate, never useful
-        for period in [10, 20, 50, 100]:
-            df[f"EMA_{period}"] = ta.ema(df["Close"], length=period).bfill()
+        ema_20 = ta.ema(df["Close"], length=20).bfill()
+        sma_50 = ta.sma(df["Close"], length=50).bfill()
+        vwap = ta.vwap(df["High"], df["Low"], df["Close"], df["Volume"]).bfill()
 
-        # SMA_200 dropped: never useful; SMA_50 kept only as price_to_sma_50 dependency
-        for period in [20, 50, 100]:
-            df[f"SMA_{period}"] = ta.sma(df["Close"], length=period).bfill()
-
-        df["price_to_ema_20"] = (df["Close"] - df["EMA_20"]) / df["EMA_20"]
-        df["price_to_sma_50"] = (df["Close"] - df["SMA_50"]) / df["SMA_50"]
-
-        df["ema_10_20_cross"] = df["EMA_10"] - df["EMA_20"]
-
-        df["VWAP"] = ta.vwap(df["High"], df["Low"], df["Close"], df["Volume"]).bfill()
-        df["price_to_vwap"] = (df["Close"] - df["VWAP"]) / df["VWAP"]
+        df["price_to_ema_20"] = (df["Close"] - ema_20) / ema_20
+        df["price_to_sma_50"] = (df["Close"] - sma_50) / sma_50
+        df["price_to_vwap"] = (df["Close"] - vwap) / vwap
 
     # ------------------------------------------------------------------
     # Momentum
@@ -111,23 +105,15 @@ class IndicatorEngine:
         df = self.df
 
         # ATR_7 dropped: correlated with ATR_14, never useful; ATR_14 kept as a dependency
-        for period in [14, 21]:
-            df[f"ATR_{period}"] = ta.atr(df["High"], df["Low"], df["Close"], length=period).bfill()
+        # ATR_21 dropped: 0.991-correlated with ATR_14, no other downstream use
+        df["ATR_14"] = ta.atr(df["High"], df["Low"], df["Close"], length=14).bfill()
 
         df["ATR_pct"] = (df["ATR_14"] / df["Close"]) * 100
 
-        bbands = ta.bbands(df["Close"], length=20, std=2)
-        if bbands is not None:
-            df["BB_lower"] = bbands.iloc[:, 0].bfill()
-            df["BB_middle"] = bbands.iloc[:, 1].bfill()
-            df["BB_upper"] = bbands.iloc[:, 2].bfill()
-
+        # BB_lower/upper, BB_middle, KC_lower/upper dropped from this engine entirely:
+        # nothing here uses them (only PriceActionEngine's squeeze_on does, and it
+        # computes its own copy as a local dependency - see its _ensure_base_indicators).
         # BB_width and BB_position dropped: neither was ever a useful condition.
-
-        kc = ta.kc(df["High"], df["Low"], df["Close"], length=20, scalar=2)
-        if kc is not None:
-            df["KC_lower"] = kc.iloc[:, 0].bfill()
-            df["KC_upper"] = kc.iloc[:, 2].bfill()
 
         df["volatility_10"] = df["Close"].pct_change().rolling(10).std()
         # volatility_20/50 dropped: unused; volatility_10 alone drives downstream features
@@ -138,16 +124,19 @@ class IndicatorEngine:
     def _add_trend_indicators(self):
         df = self.df
 
-        for period in [14, 20]:
-            adx_df = ta.adx(df["High"], df["Low"], df["Close"], length=period)
-            df[f"ADX_{period}"] = adx_df[f"ADX_{period}"].bfill()
-            df[f"DMP_{period}"] = adx_df[f"DMP_{period}"].bfill()
-            df[f"DMN_{period}"] = adx_df[f"DMN_{period}"].bfill()
+        # ADX_20/DMP_20/DMN_20 dropped: 0.93-0.98-correlated with the _14 versions, no other downstream use
+        adx_df = ta.adx(df["High"], df["Low"], df["Close"], length=14)
+        df["ADX_14"] = adx_df["ADX_14"].bfill()
+        df["DMP_14"] = adx_df["DMP_14"].bfill()
+        df["DMN_14"] = adx_df["DMN_14"].bfill()
 
         df["directional_bias"] = df["DMP_14"] - df["DMN_14"]
 
         supertrend = ta.supertrend(df["High"], df["Low"], df["Close"], length=10, multiplier=3)
-        df["supertrend"] = supertrend["SUPERT_10_3"].bfill()
+        # raw supertrend line kept as an instance attribute (trend_strength dependency
+        # below), never a df column - it's a price level, >=0.98-correlated with the
+        # EMA/SMA/VWAP cluster, so exposing it would just add a near-duplicate condition
+        self._supertrend = supertrend["SUPERT_10_3"].bfill()
         df["supertrend_direction"] = supertrend["SUPERTd_10_3"].bfill()
 
         # st_flip dropped: rare + negative lift in combo search (kept internally - bars_since_flip needs it)
@@ -166,9 +155,10 @@ class IndicatorEngine:
         df = self.df
 
         # OBV/OBV_ema/AD dropped: redundant with each other, never useful
+        # VPT dropped: 0.98+-correlated with the price-level cluster (cumulative,
+        # tracks price direction over time in trending data), no downstream use
         df["CMF"] = ta.cmf(df["High"], df["Low"], df["Close"], df["Volume"], length=20).bfill()
         df["MFI"] = ta.mfi(df["High"], df["Low"], df["Close"], df["Volume"], length=14).bfill()
-        df["VPT"] = ta.pvt(df["Close"], df["Volume"]).bfill()
 
     # ------------------------------------------------------------------
     # Candle patterns
@@ -249,7 +239,7 @@ class IndicatorEngine:
             df["return_1"].rolling(20).std() + 0.0001
         )
         new_features["path_curvature"] = df["return_1"].diff().abs().rolling(10).mean()
-        new_features["trend_strength"] = abs(df["Close"] - df["supertrend"]) / df["Close"]
+        new_features["trend_strength"] = abs(df["Close"] - self._supertrend) / df["Close"]
         new_features["trend_acceleration"] = new_features["trend_strength"].diff()
         new_features["dir_entropy"] = df["return_1"].rolling(20).apply(
             lambda x: -np.mean(np.sign(x) * np.log(np.abs(np.sign(x)) + 1e-6))

@@ -28,16 +28,35 @@ class PriceActionEngine:
     # Base indicators (only computed if IndicatorEngine hasn't already)
     # ------------------------------------------------------------------
     def _ensure_base_indicators(self):
+        """Columns that are also legitimate standalone search conditions (ATR_14,
+        MACD family, ADX_14/DMP_14/DMN_14, supertrend_direction, volume_ratio) are
+        written to df as usual. Raw price-level dependencies (EMA_10/20/50, RSI_14,
+        VWAP, BB/KC bands) are kept as instance attributes instead - never written
+        to df - since they're all >=0.98-correlated with each other (just different
+        smoothings of Close) and would only add near-duplicate conditions to the
+        combo search. Reused from df if some earlier step already computed them."""
         df = self.df
 
-        if "EMA_10" not in df.columns:
-            df["EMA_10"] = ta.ema(df["Close"], length=10).bfill()
-        if "EMA_20" not in df.columns:
-            df["EMA_20"] = ta.ema(df["Close"], length=20).bfill()
-        if "EMA_50" not in df.columns:
-            df["EMA_50"] = ta.ema(df["Close"], length=50).bfill()
-        if "RSI_14" not in df.columns:
-            df["RSI_14"] = ta.rsi(df["Close"], length=14).bfill()
+        self._ema_10 = df["EMA_10"] if "EMA_10" in df.columns else ta.ema(df["Close"], length=10).bfill()
+        self._ema_20 = df["EMA_20"] if "EMA_20" in df.columns else ta.ema(df["Close"], length=20).bfill()
+        self._ema_50 = df["EMA_50"] if "EMA_50" in df.columns else ta.ema(df["Close"], length=50).bfill()
+        self._rsi_14 = df["RSI_14"] if "RSI_14" in df.columns else ta.rsi(df["Close"], length=14).bfill()
+        self._vwap = (
+            df["VWAP"] if "VWAP" in df.columns else ta.vwap(df["High"], df["Low"], df["Close"], df["Volume"]).bfill()
+        )
+
+        if "BB_upper" in df.columns:
+            self._bb_lower, self._bb_upper = df["BB_lower"], df["BB_upper"]
+        else:
+            bb = ta.bbands(df["Close"], length=20, std=2)
+            self._bb_lower, self._bb_upper = bb.iloc[:, 0].bfill(), bb.iloc[:, 2].bfill()
+
+        if "KC_upper" in df.columns:
+            self._kc_lower, self._kc_upper = df["KC_lower"], df["KC_upper"]
+        else:
+            kc = ta.kc(df["High"], df["Low"], df["Close"], length=20, scalar=2)
+            self._kc_lower, self._kc_upper = kc.iloc[:, 0].bfill(), kc.iloc[:, 2].bfill()
+
         if "ATR_14" not in df.columns:
             df["ATR_14"] = ta.atr(df["High"], df["Low"], df["Close"], length=14).bfill()
         if "MACD_hist" not in df.columns or "MACD" not in df.columns or "MACD_signal" not in df.columns:
@@ -53,17 +72,6 @@ class PriceActionEngine:
         if "supertrend_direction" not in df.columns:
             st = ta.supertrend(df["High"], df["Low"], df["Close"], length=10, multiplier=3)
             df["supertrend_direction"] = st["SUPERTd_10_3"].bfill()
-        if "VWAP" not in df.columns:
-            df["VWAP"] = ta.vwap(df["High"], df["Low"], df["Close"], df["Volume"]).bfill()
-        if "BB_upper" not in df.columns:
-            bb = ta.bbands(df["Close"], length=20, std=2)
-            df["BB_lower"] = bb.iloc[:, 0].bfill()
-            df["BB_middle"] = bb.iloc[:, 1].bfill()
-            df["BB_upper"] = bb.iloc[:, 2].bfill()
-        if "KC_upper" not in df.columns:
-            kc = ta.kc(df["High"], df["Low"], df["Close"], length=20, scalar=2)
-            df["KC_lower"] = kc.iloc[:, 0].bfill()
-            df["KC_upper"] = kc.iloc[:, 2].bfill()
         if "volume_ratio" not in df.columns:
             df["volume_ratio"] = df["Volume"] / df["Volume"].rolling(20).mean()
 
@@ -235,14 +243,14 @@ class PriceActionEngine:
             dn = (fast < slow) & (fast.shift(1) >= slow.shift(1))
             return np.where(up, 1, np.where(dn, -1, 0))
 
-        df["sig_ema_10_20_cross"] = cross(df["EMA_10"], df["EMA_20"])
-        df["sig_ema_20_50_cross"] = cross(df["EMA_20"], df["EMA_50"])
+        df["sig_ema_10_20_cross"] = cross(self._ema_10, self._ema_20)
+        df["sig_ema_20_50_cross"] = cross(self._ema_20, self._ema_50)
         df["sig_macd_signal_cross"] = cross(df["MACD"], df["MACD_signal"])
-        df["sig_price_vwap_cross"] = cross(df["Close"], df["VWAP"])
-        df["sig_price_ema20_cross"] = cross(df["Close"], df["EMA_20"])
+        df["sig_price_vwap_cross"] = cross(df["Close"], self._vwap)
+        df["sig_price_ema20_cross"] = cross(df["Close"], self._ema_20)
 
-        rsi_up = (df["RSI_14"] > 50) & (df["RSI_14"].shift(1) <= 50)
-        rsi_dn = (df["RSI_14"] < 50) & (df["RSI_14"].shift(1) >= 50)
+        rsi_up = (self._rsi_14 > 50) & (self._rsi_14.shift(1) <= 50)
+        rsi_dn = (self._rsi_14 < 50) & (self._rsi_14.shift(1) >= 50)
         df["sig_rsi50_cross"] = np.where(rsi_up, 1, np.where(rsi_dn, -1, 0))
         return self
 
@@ -269,7 +277,7 @@ class PriceActionEngine:
         df["resistance_level"] = resistance
 
         # --- TTM squeeze state ---
-        squeeze_on = (df["BB_upper"] < df["KC_upper"]) & (df["BB_lower"] > df["KC_lower"])
+        squeeze_on = (self._bb_upper < self._kc_upper) & (self._bb_lower > self._kc_lower)
         df["squeeze_on"] = squeeze_on.astype(int)
         return self
 
@@ -348,13 +356,13 @@ class PriceActionEngine:
         df = self.df
 
         # --- EMA pullback ---
-        uptrend = df["EMA_20"] > df["EMA_50"]
-        dntrend = df["EMA_20"] < df["EMA_50"]
-        touch_up = (df["Low"] <= df["EMA_20"]) & (df["Close"] > df["EMA_20"]) & (df["Close"] > df["Open"])
-        touch_dn = (df["High"] >= df["EMA_20"]) & (df["Close"] < df["EMA_20"]) & (df["Close"] < df["Open"])
+        uptrend = self._ema_20 > self._ema_50
+        dntrend = self._ema_20 < self._ema_50
+        touch_up = (df["Low"] <= self._ema_20) & (df["Close"] > self._ema_20) & (df["Close"] > df["Open"])
+        touch_dn = (df["High"] >= self._ema_20) & (df["Close"] < self._ema_20) & (df["Close"] < df["Open"])
         df["sig_ema_pullback"] = np.where(
-            uptrend & touch_up & (df["RSI_14"] > 45), 1,
-            np.where(dntrend & touch_dn & (df["RSI_14"] < 55), -1, 0),
+            uptrend & touch_up & (self._rsi_14 > 45), 1,
+            np.where(dntrend & touch_dn & (self._rsi_14 < 55), -1, 0),
         )
 
         # --- Golden zone (fib 0.5 - 0.618 of the last confirmed impulse) ---
@@ -437,11 +445,11 @@ class PriceActionEngine:
         df = self.df
 
         votes = (
-            np.sign(df["EMA_20"] - df["EMA_50"])
+            np.sign(self._ema_20 - self._ema_50)
             + df["supertrend_direction"]
             + np.sign(df["MACD_hist"])
             + np.sign(df["DMP_14"] - df["DMN_14"]) * (df["ADX_14"] > 20)
-            + np.sign(df["Close"] - df["VWAP"])
+            + np.sign(df["Close"] - self._vwap)
         )
         df["trend_score"] = votes
         return self

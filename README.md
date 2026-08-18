@@ -35,7 +35,10 @@ package uses relative imports internally.)
 This will:
 1. Fetch OHLCV candles (or load them from the `data/` cache if already fetched).
 2. Build ~100 indicator/price-action columns.
-3. Exhaustively search combinations of conditions for profitable strategies.
+3. Exhaustively search combinations of conditions for profitable strategies. Every combo
+   is inserted into `data/combo_results.db` (SQLite) as soon as it's simulated, so a crash
+   or interrupted run never loses more than the one in-flight batch. Each new run first
+   wipes this table - it only ever holds the latest run's results.
 4. Write everything - dataset stats, every profitable combo found, and the indicator
    diagnostics (contribution/redundancy/perfect-predictor/direction-vs-target-gap
    analysis) - to `data/report.json`.
@@ -45,6 +48,17 @@ the search can take anywhere from minutes to much longer - it prints progress ba
 short run summary (total time, rows/columns, best result, where the output landed) to the
 console when done. The full results (every profitable combo, indicator diagnostics) are
 written to `data/report.json`.
+
+## 2. Browse results in the viewer
+
+```bash
+python3 -m strategy_finder.webapp
+```
+
+Starts a small Flask app at `http://127.0.0.1:5050` reading straight from
+`data/combo_results.db` - summary stats plus a sortable/filterable table of every combo
+(direction, size, fires, trades, win rate, PnL, return %). Works while the search is
+still running too, since results are inserted incrementally.
 
 ## Re-running after changing indicators/signals
 
