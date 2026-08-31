@@ -15,8 +15,8 @@ four trader/data-scientist questions about the *kept* indicator set:
    actual median excursion size.
 
 All four are pure functions over already-computed data (a df, or the
-condition_dictionary/combinations already saved in report.json) - no changes
-to how simulate_trades() actually trades.
+condition_dictionary/combinations already saved in data/combo_results.db) -
+no changes to how simulate_trades() actually trades.
 """
 
 import math

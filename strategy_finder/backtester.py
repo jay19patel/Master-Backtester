@@ -21,23 +21,10 @@ from .price_action_engine import PriceActionEngine
 def simulate_trades(
     sig, open_, high, low, close,
     initial_capital, risk_per_trade_pct, stop_loss_pct, take_profit_pct, max_hold_bars, fee_pct,
-    index=None,
+    index=None, atr=None, swing_high=None, swing_low=None, sl_tp_mode="fixed",
 ):
-    """Core bracket simulation - vectorized. Shared by Backtester (full trade
-    detail incl. timestamps) and ComboBacktester's workers (index=None skips
-    entry_time/exit_time, keeping the payload numpy-only).
-
-    Only two things about this are genuinely sequential: which bars get
-    "consumed" by an already-open trade's holding window (a signal firing
-    mid-trade is skipped, never evaluated), and equity compounding (position
-    size depends on current equity). Resolving *where* any single trade would
-    exit - bar, price, stop-vs-target-vs-time - does not depend on any other
-    trade, only on its own forward OHLC window. So this runs in two passes:
-    a fully vectorized numpy pass resolves every signal-fire's exit in one
-    shot (a sliding window over the forward max_hold_bars candles, no
-    per-trade Python loop), then a cheap sequential pass - one step per
-    signal fire, not per bar - applies the two sequential rules using each
-    fire's already-computed exit info."""
+    """Core bracket simulation - vectorized. Supports fixed %, ATR-based, and
+    Swing High/Low dynamic SL/TP modes."""
     n = len(open_)
     signal_i = np.flatnonzero(np.asarray(sig)[: n - 1])  # sig[i] != 0, matches `while i < n-1`
     if len(signal_i) == 0:
@@ -47,11 +34,31 @@ def simulate_trades(
     entry_i = signal_i + 1  # act on the NEXT candle's open - no lookahead (always < n here)
     entry_price = open_[entry_i]
 
-    stop_dist = entry_price * (stop_loss_pct / 100)
-    target_dist = entry_price * (take_profit_pct / 100)
     is_long = directions == 1
+
+    if sl_tp_mode == "atr" and atr is not None:
+        # Dynamic ATR-based: SL = 1.5 * ATR, TP = 3.0 * ATR
+        entry_atr = atr[entry_i]
+        entry_atr = np.nan_to_num(entry_atr, nan=entry_price * 0.01)
+        stop_dist = np.maximum(entry_atr * 1.5, entry_price * 0.003)
+        target_dist = np.maximum(entry_atr * 3.0, entry_price * 0.006)
+    elif sl_tp_mode == "swing" and swing_high is not None and swing_low is not None:
+        # Dynamic Swing High/Low based: SL at recent swing low (long) or swing high (short)
+        recent_sh = swing_high[entry_i]
+        recent_sl = swing_low[entry_i]
+        long_stop_dist = np.maximum(entry_price - recent_sl, entry_price * 0.005)
+        short_stop_dist = np.maximum(recent_sh - entry_price, entry_price * 0.005)
+        stop_dist = np.where(is_long, long_stop_dist, short_stop_dist)
+        stop_dist = np.nan_to_num(stop_dist, nan=entry_price * 0.01)
+        target_dist = stop_dist * 2.0  # 1:2 R:R
+    else:
+        # Fixed % mode
+        stop_dist = entry_price * (stop_loss_pct / 100)
+        target_dist = entry_price * (take_profit_pct / 100)
+
     stop_price = np.where(is_long, entry_price - stop_dist, entry_price + stop_dist)
     target_price = np.where(is_long, entry_price + target_dist, entry_price - target_dist)
+
 
     # Forward window entry_i..entry_i+max_hold_bars inclusive (max_hold_bars+1 bars),
     # padded with NaN past the real array so every candidate gets a same-length window -

@@ -5,7 +5,12 @@
       "Bash(python3 -c \"import ast; ast.parse\\(open\\('strategy_finder/main.py'\\).read\\(\\)\\); ast.parse\\(open\\('strategy_finder/combo_backtester.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(python3 -c \"import ast; ast.parse\\(open\\('strategy_finder/combo_backtester.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(python3 -c ' *)",
-      "Bash(rm -f data/combo_results.db*)"
+      "Bash(rm -f data/combo_results.db*)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('strategy_finder/combo_backtester.py'\\).read\\(\\)\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('strategy_finder/main.py'\\).read\\(\\)\\)\")",
+      "Bash(rm -f /tmp/test_combo.db /tmp/test_combo2.db)",
+      "Bash(python3 -m pytest tests/ -q)",
+      "Bash(python3 -m pytest tests/ -v)"
     ]
   }
 }

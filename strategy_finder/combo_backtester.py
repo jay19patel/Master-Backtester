@@ -21,12 +21,27 @@ ANDing more conditions in can only shrink fire count, never grow it, so this
 loses no reachable result.
 
 Apriori-style level-wise search: size-k combos only extend size-(k-1) combos
-that already cleared `min_fires`. Size-1 conditions are simulated immediately
-to get a real standalone `total_pnl` as a quality score. `max_survivors_per_level`
-and `max_raw_candidates_per_level` are optional (None = no cap, fully
-exhaustive); when set and a level exceeds them, only the top-scoring combos
-(by summed member quality score) continue - never random - reported via
-`trimmed_levels` so a capped run is never mistaken for exhaustive.
+that already cleared `min_fires`. `max_survivors_per_level` and
+`max_raw_candidates_per_level` are optional (None = no cap, fully exhaustive);
+when set and a level exceeds them, only the top-scoring combos continue -
+never random - reported via `trimmed_levels` so a capped run is never
+mistaken for exhaustive.
+
+Trim scoring (see `_extend_and_filter_batch`): each candidate's own fire
+mask (already computed to check `min_fires`) is scored directly - NOT by summing its
+members' standalone solo PnL. Two mediocre-alone conditions can have a real
+combined edge that a sum-of-parts score would rank low and prune before it
+ever reaches a larger size; scoring the combo's own fires avoids that. The
+score is a t-stat-style measure (mean bracket return / stdev, scaled by
+sqrt(fire count)) of a cheap proxy trade using the SAME SL/TP bracket as the
+real engine (`_dense_bracket_returns` mirrors simulate_trades' atr/swing/
+fixed modes) - just without fees, position sizing, or overlap-skipping,
+which need the real sequential engine. Computed with plain vectorized numpy
+on data already in memory, so it adds negligible cost next to the fire-count
+check it rides alongside. It rewards both a real directional edge and enough
+fires to trust it, and is only used to pick which combos continue the
+search - final reported results still come from the real `simulate_trades`
+engine.
 
 Performance: every phase (warm-up simulation, candidate extension, fire-count
 prefilter, trade simulation) runs across a process pool (`n_workers`). Pool
@@ -42,8 +57,10 @@ from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import pandas as pd
+from numpy.lib.stride_tricks import sliding_window_view
 from rich.console import Console
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+from rich.table import Table
 
 from . import db as results_db
 from .backtester import simulate_trades
@@ -54,12 +71,21 @@ OHLCV_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 _WORKER_STATE = {}
 
 
-def _init_worker(pools_by_direction, ohlc, params, names_list_by_direction, name_rank_by_direction):
+def _init_worker(pools_by_direction, ohlc, params, names_list_by_direction, name_rank_by_direction, bracket_returns_by_direction):
     _WORKER_STATE["pools"] = pools_by_direction
     _WORKER_STATE["ohlc"] = ohlc
     _WORKER_STATE["params"] = params
     _WORKER_STATE["names_list"] = names_list_by_direction
     _WORKER_STATE["name_rank"] = name_rank_by_direction
+    _WORKER_STATE["fwd"] = bracket_returns_by_direction
+    _WORKER_STATE["fwd_sq"] = {d: r * r for d, r in bracket_returns_by_direction.items()}
+    # Dense (pool_size x n_candles) bool matrix per direction, row order matching
+    # names_list - lets _extend_and_filter_batch AND+score an entire parent's
+    # candidate extensions in one matrix op instead of one call per candidate.
+    _WORKER_STATE["pool_matrix"] = {
+        d: np.array([pools_by_direction[d][name] for name in names])
+        for d, names in names_list_by_direction.items()
+    }
 
 
 def _mask_for(pool, combo):
@@ -69,28 +95,185 @@ def _mask_for(pool, combo):
     return mask
 
 
+def _dense_bracket_returns(
+    direction, open_, high, low, close, max_hold_bars,
+    sl_tp_mode="atr", atr=None, swing_high=None, swing_low=None,
+    stop_loss_pct=None, take_profit_pct=None,
+):
+    """Vectorized, direction-signed %% return using the SAME SL/TP bracket
+    logic as simulate_trades' 'atr'/'swing'/'fixed' modes, computed for
+    EVERY candle as if a signal fired there (ignoring fees, position sizing,
+    and trade overlap - those need the real sequential engine). Used ONLY to
+    rank candidates for beam trimming (see module docstring), never to
+    report results.
+
+    This matters: a naive fixed-horizon close-to-close return ignores the
+    actual bracket shape entirely (e.g. ATR mode's 1:2 risk:reward with
+    early stop-outs), so it can rank a combo very differently from what
+    simulate_trades later finds - the exact mismatch that let a real
+    high-quality combo get trimmed out in favor of worse ones. Mirroring the
+    bracket mechanics closes that gap while staying a single vectorized
+    pass (no per-trade Python loop), computed once per direction per run."""
+    n = len(open_)
+    is_long = direction == 1
+    entry_i = np.arange(n) + 1
+    entry_i_c = np.minimum(entry_i, n - 1)
+    valid = entry_i < n
+    entry_price = open_[entry_i_c]
+
+    if sl_tp_mode == "atr" and atr is not None:
+        entry_atr = atr[entry_i_c]
+        entry_atr = np.nan_to_num(entry_atr, nan=entry_price * 0.01)
+        stop_dist = np.maximum(entry_atr * 1.5, entry_price * 0.003)
+        target_dist = np.maximum(entry_atr * 3.0, entry_price * 0.006)
+    elif sl_tp_mode == "swing" and swing_high is not None and swing_low is not None:
+        recent_sh = swing_high[entry_i_c]
+        recent_sl = swing_low[entry_i_c]
+        stop_dist = (
+            np.maximum(entry_price - recent_sl, entry_price * 0.005)
+            if is_long
+            else np.maximum(recent_sh - entry_price, entry_price * 0.005)
+        )
+        stop_dist = np.nan_to_num(stop_dist, nan=entry_price * 0.01)
+        target_dist = stop_dist * 2.0
+    else:
+        stop_dist = entry_price * ((stop_loss_pct or 0.5) / 100)
+        target_dist = entry_price * ((take_profit_pct or 1.0) / 100)
+
+    stop_price = entry_price - stop_dist if is_long else entry_price + stop_dist
+    target_price = entry_price + target_dist if is_long else entry_price - target_dist
+
+    window_len = max_hold_bars + 1
+    pad = np.full(window_len, np.nan)
+    high_windows = sliding_window_view(np.concatenate([high, pad]), window_len)[entry_i_c]
+    low_windows = sliding_window_view(np.concatenate([low, pad]), window_len)[entry_i_c]
+
+    if is_long:
+        hit_stop = low_windows <= stop_price[:, None]
+        hit_target = high_windows >= target_price[:, None]
+    else:
+        hit_stop = high_windows >= stop_price[:, None]
+        hit_target = low_windows <= target_price[:, None]
+    any_hit = hit_stop | hit_target
+
+    has_hit = any_hit.any(axis=1)
+    first_col = np.argmax(any_hit, axis=1)
+    stop_wins = hit_stop[np.arange(n), first_col]  # same-bar tie -> stop wins, matching simulate_trades
+    is_stop = has_hit & stop_wins
+    is_target = has_hit & ~stop_wins
+
+    time_exit_i = np.minimum(entry_i + max_hold_bars, n - 1)
+    exit_price = np.where(is_stop, stop_price, np.where(is_target, target_price, close[time_exit_i]))
+
+    ret = (exit_price - entry_price) / entry_price * direction
+    return np.where(valid, ret, 0.0)
+
+
+def build_best_of_table(profitable, min_trades):
+    """Rich table of the best combo along different axes - raw profit,
+    long/short split, win rate, and a balanced pick - not just the single
+    top-PnL row. Shared by ComboBacktester.print_report() and main.py's
+    end-of-run summary so both show the same breakdown. `profitable` is a
+    DataFrame of only total_pnl > 0 rows, sorted best PnL first."""
+    long_rows = profitable[profitable["direction"] == "Long"]
+    short_rows = profitable[profitable["direction"] == "Short"]
+    eligible = profitable[profitable["trades"] >= min_trades]
+
+    best_win_rate = eligible.sort_values("win_rate_pct", ascending=False).iloc[0] if not eligible.empty else None
+    best_balanced = None
+    if not eligible.empty:
+        # Rewards profit AND win rate together, scaled by sqrt(trades) so a
+        # combo needs enough trades to trust it - not just one extreme metric.
+        composite = (eligible["return_pct"] / 100) * (eligible["win_rate_pct"] / 100) * np.sqrt(eligible["trades"])
+        best_balanced = eligible.loc[composite.idxmax()]
+
+    table = Table(title="Best Of", show_lines=False)
+    table.add_column("Category", style="bold")
+    table.add_column("Dir")
+    table.add_column("Combo", overflow="fold")
+    table.add_column("Size", justify="right")
+    table.add_column("Trades", justify="right")
+    table.add_column("Win%", justify="right")
+    table.add_column("Return%", justify="right")
+    table.add_column("Final $", justify="right")
+
+    def add_row(label, row):
+        if row is None:
+            table.add_row(label, "-", "[dim]no qualifying combo[/dim]", "-", "-", "-", "-", "-")
+            return
+        pnl_style = "green" if row["total_pnl"] > 0 else "red"
+        table.add_row(
+            label, row["direction"], row["combo"], str(row["size"]), str(row["trades"]),
+            f"{row['win_rate_pct']:.1f}", f"[{pnl_style}]{row['return_pct']:+.1f}[/{pnl_style}]",
+            f"{row['final_equity']:.2f}",
+        )
+
+    add_row("Max Profit (overall)", profitable.iloc[0])
+    add_row("Best Long", long_rows.iloc[0] if not long_rows.empty else None)
+    add_row("Best Short", short_rows.iloc[0] if not short_rows.empty else None)
+    add_row(f"Best Win Rate (>={min_trades} trades)", best_win_rate)
+    add_row("Decent Balanced Best*", best_balanced)
+    return table
+
+
 def _extend_and_filter_batch(args):
     """Generation-phase worker: args is (direction, parent_combos_chunk).
     Extends each parent only with names ranked after its own highest member
     (fixed canonical rank per pool name - same trick itertools.combinations
     uses internally), so no two parents ever reach the same k-combo and no
-    dedup pass is needed. Returns (survivors, examined_count)."""
+    dedup pass is needed.
+
+    All of a parent's candidate extensions are AND-ed and scored together in
+    one matrix op (pool_matrix slice & parent_mask -> fires via a row sum,
+    score via two matrix-vector products against the bracket-return array
+    and its square) instead of one Python/numpy call per candidate. With
+    hundreds of thousands to millions of candidates per level, per-call
+    overhead - not the actual math - was what made scoring each one
+    separately ~6x slower than the unscored version; batching removes that
+    overhead while keeping the exact same t-stat-style score (mean bracket
+    return over its stdev, scaled by sqrt(fire count), via the identity
+    var = E[x^2] - E[x]^2). Returns (survivors, examined_count)."""
     direction, parent_chunk = args
     pool = _WORKER_STATE["pools"][direction]
     min_fires = _WORKER_STATE["params"]["min_fires"]
     rank = _WORKER_STATE["name_rank"][direction]
     names_list = _WORKER_STATE["names_list"][direction]
+    pool_matrix = _WORKER_STATE["pool_matrix"][direction]
+    fwd = _WORKER_STATE["fwd"][direction]
+    fwd_sq = _WORKER_STATE["fwd_sq"][direction]
 
     survivors = []
     examined = 0
     for combo_names in parent_chunk:
         parent_mask = _mask_for(pool, combo_names)
         start = rank[combo_names[-1]] + 1
-        for name in names_list[start:]:
-            examined += 1
-            fires = int(np.count_nonzero(parent_mask & pool[name]))
-            if fires >= min_fires:
-                survivors.append((direction, combo_names + (name,), fires))
+        candidate_names = names_list[start:]
+        examined += len(candidate_names)
+        if not candidate_names:
+            continue
+
+        combo_matrix = pool_matrix[start:] & parent_mask[None, :]
+        fires_arr = combo_matrix.sum(axis=1)
+        keep = fires_arr >= min_fires
+        if not keep.any():
+            continue
+
+        kept_idx = np.flatnonzero(keep)
+        combo_f = combo_matrix[kept_idx].astype(np.float64)
+        fires_kept = fires_arr[kept_idx].astype(np.float64)
+        # errstate: some BLAS backends (e.g. Accelerate) raise transient
+        # divide/overflow warnings on intermediate blocked-matmul steps that
+        # cancel out before the final result - verified bit-exact against a
+        # scalar per-candidate reference, so these are cosmetic, not real.
+        with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+            mean = (combo_f @ fwd) / fires_kept
+            var = np.maximum((combo_f @ fwd_sq) / fires_kept - mean * mean, 0.0)
+        std = np.sqrt(var)
+        sqrt_n = np.sqrt(fires_kept)
+        score = np.where(std > 0, mean / np.where(std > 0, std, 1.0) * sqrt_n, mean * sqrt_n)
+
+        for j, idx in enumerate(kept_idx):
+            survivors.append((direction, combo_names + (candidate_names[idx],), int(fires_arr[idx]), float(score[j])))
     return survivors, examined
 
 
@@ -106,6 +289,11 @@ def _evaluate_batch(tasks):
     rows = []
     simulated = 0
 
+    sl_tp_mode = params.get("sl_tp_mode", "atr")
+    atr = ohlc.get("atr")
+    swing_high = ohlc.get("swing_high")
+    swing_low = ohlc.get("swing_low")
+
     for direction, combo in tasks:
         mask = _mask_for(pools[direction], combo)
         direction_array = np.where(mask, direction, 0)
@@ -114,7 +302,9 @@ def _evaluate_batch(tasks):
             ohlc["open"], ohlc["high"], ohlc["low"], ohlc["close"],
             params["initial_capital"], params["risk_per_trade_pct"], params["stop_loss_pct"],
             params["take_profit_pct"], params["max_hold_bars"], params["fee_pct"],
+            atr=atr, swing_high=swing_high, swing_low=swing_low, sl_tp_mode=sl_tp_mode,
         )
+
         simulated += 1
 
         n_trades = len(trades)
@@ -123,6 +313,18 @@ def _evaluate_batch(tasks):
 
         wins = [t for t in trades if t["pnl"] > 0]
         total_pnl = final_equity - params["initial_capital"]
+
+        avg_sl_pct = (
+            sum(abs(t["entry_price"] - t["stop_price"]) / t["entry_price"] * 100 for t in trades) / n_trades
+            if n_trades > 0
+            else params["stop_loss_pct"]
+        )
+        avg_tp_pct = (
+            sum(abs(t["target_price"] - t["entry_price"]) / t["entry_price"] * 100 for t in trades) / n_trades
+            if n_trades > 0
+            else params["take_profit_pct"]
+        )
+
         rows.append({
             "direction": "Long" if direction == 1 else "Short",
             "combo": " AND ".join(combo),
@@ -131,10 +333,13 @@ def _evaluate_batch(tasks):
             "fires": int(np.count_nonzero(mask)),
             "trades": n_trades,
             "win_rate_pct": round(len(wins) / n_trades * 100, 1),
+            "avg_sl_pct": round(avg_sl_pct, 2),
+            "avg_tp_pct": round(avg_tp_pct, 2),
             "final_equity": round(final_equity, 2),
             "total_pnl": round(total_pnl, 2),
             "return_pct": round(total_pnl / params["initial_capital"] * 100, 1),
         })
+
 
     return rows, simulated
 
@@ -156,6 +361,7 @@ class ComboBacktester:
         risk_per_trade_pct=2.0,
         stop_loss_pct=0.5,
         take_profit_pct=1.0,
+        sl_tp_mode="atr",
         max_hold_bars=20,
         fee_pct=0.05,
         min_combo_size=1,
@@ -173,6 +379,8 @@ class ComboBacktester:
         self.risk_per_trade_pct = risk_per_trade_pct
         self.stop_loss_pct = stop_loss_pct
         self.take_profit_pct = take_profit_pct
+        self.sl_tp_mode = sl_tp_mode
+
         self.max_hold_bars = max_hold_bars
         self.fee_pct = fee_pct
         self.min_combo_size = min_combo_size
@@ -308,12 +516,22 @@ class ComboBacktester:
     def _generate_tasks(self, pools_by_direction, names_list_by_direction, name_rank_by_direction, executor, progress, console):
         """Apriori-style level-wise search, parallelized across every core
         including candidate generation. Size-1 conditions are simulated
-        immediately so each has a real quality score. At each later level,
-        candidate generation + fire-count filtering run on the process pool;
-        if survivors exceed max_survivors_per_level, only the top-scoring
-        (summed quality score) continue - never a random slice."""
-        tasks = []      # (direction, combo_names) for sizes 2+ awaiting final simulation
-        warm_rows = []  # already-simulated size-1 rows
+        immediately for real reported rows. At each later level, candidate
+        generation + fire-count filtering run on the process pool, scoring
+        each survivor's own fires as it goes (see `_extend_and_filter_batch`); if survivors
+        exceed max_survivors_per_level, only the top-scoring continue -
+        never a random slice.
+
+        Each level that clears `min_combo_size` is simulated and persisted to
+        the results DB right here, as soon as that level finishes - not
+        accumulated into one giant list simulated only after every size for
+        every direction has been generated. On a search with no
+        max_combo_size ceiling (the default), generation alone can run for a
+        long time; without this, a kill anywhere before the very end loses
+        100% of results regardless of how far the search got, since nothing
+        would have been simulated yet. With it, a kill mid-run keeps every
+        level that finished before that point."""
+        rows = []       # every persisted real-trade row so far, across all sizes/directions
         tested = 0
         cleared = 0
         simulated_count = 0
@@ -341,15 +559,11 @@ class ComboBacktester:
                 f"trade ({time.monotonic() - direction_start:.1f}s elapsed)"
             )
 
-            condition_score = {row["conditions"][0]: row["total_pnl"] for row in size1_rows}
             if self.min_combo_size <= 1:
-                warm_rows.extend(size1_rows)
+                rows.extend(size1_rows)
 
             current_combos = [(name,) for name in names_list]
             size_reached = 1
-
-            def combo_score(combo_names, _scores=condition_score):
-                return sum(_scores.get(name, 0.0) for name in combo_names)
 
             size = 1
             while current_combos and size < self.max_combo_size:
@@ -414,22 +628,28 @@ class ComboBacktester:
                 if time_budget_hit_mid_level:
                     # Partial level: real survivors, but not fully examined.
                     if has_survivor_cap and original_count > self.max_survivors_per_level:
-                        survivors.sort(key=lambda item: combo_score(item[1]), reverse=True)
+                        survivors.sort(key=lambda item: item[3], reverse=True)
                         survivors = survivors[: self.max_survivors_per_level]
                     trimmed_levels.append(
                         (direction, size, "time_budget", original_count, self.max_search_seconds, len(survivors))
                     )
                 elif has_survivor_cap and original_count > self.max_survivors_per_level:
-                    survivors.sort(key=lambda item: combo_score(item[1]), reverse=True)
+                    survivors.sort(key=lambda item: item[3], reverse=True)
                     survivors = survivors[: self.max_survivors_per_level]
                     trimmed_levels.append(
                         (direction, size, "survivors", original_count, self.max_survivors_per_level, len(survivors))
                     )
 
                 cleared += len(survivors)
-                next_combos = [combo_names for (_, combo_names, _fires) in survivors]
-                if size >= self.min_combo_size:
-                    tasks.extend((direction, combo_names) for combo_names in next_combos)
+                next_combos = [combo_names for (_, combo_names, _fires, _score) in survivors]
+                if size >= self.min_combo_size and next_combos:
+                    level_tasks = [(direction, combo_names) for combo_names in next_combos]
+                    level_rows, level_simulated = self._simulate_tasks(
+                        level_tasks, executor, progress, f"[{label}] size {size}: simulating", console=console,
+                        persist=True,
+                    )
+                    rows.extend(level_rows)
+                    simulated_count += level_simulated
                 if next_combos:
                     size_reached = size
                 current_combos = next_combos
@@ -449,7 +669,7 @@ class ComboBacktester:
 
         self.max_size_reached = max_size_reached
         self.trimmed_levels = trimmed_levels
-        return tasks, warm_rows, tested, cleared, simulated_count
+        return rows, tested, cleared, simulated_count
 
     def run(self):
         """Backtest every qualifying combination, at every size. Returns a
@@ -463,20 +683,42 @@ class ComboBacktester:
         long_pool, short_pool = self._build_pools()
         pools_by_direction = {1: long_pool, -1: short_pool}
 
+        atr_col = "ATR_14" if "ATR_14" in self.df.columns else ([c for c in self.df.columns if c.startswith("ATR_")] or [None])[0]
+        sh_col = "swing_high" if "swing_high" in self.df.columns else None
+        sl_col = "swing_low" if "swing_low" in self.df.columns else None
+
         ohlc = {
             "open": self.df["Open"].to_numpy(),
             "high": self.df["High"].to_numpy(),
             "low": self.df["Low"].to_numpy(),
             "close": self.df["Close"].to_numpy(),
+            "atr": self.df[atr_col].to_numpy() if atr_col and atr_col in self.df.columns else None,
+            "swing_high": self.df[sh_col].to_numpy() if sh_col and sh_col in self.df.columns else None,
+            "swing_low": self.df[sl_col].to_numpy() if sl_col and sl_col in self.df.columns else None,
         }
         params = {
             "initial_capital": self.initial_capital,
             "risk_per_trade_pct": self.risk_per_trade_pct,
             "stop_loss_pct": self.stop_loss_pct,
             "take_profit_pct": self.take_profit_pct,
+            "sl_tp_mode": self.sl_tp_mode,
             "max_hold_bars": self.max_hold_bars,
             "fee_pct": self.fee_pct,
             "min_fires": self.min_fires,
+        }
+
+
+        # Bracket-aware per-candle return proxy (same SL/TP mechanics as the real
+        # engine), computed once per direction and shared by every worker - used
+        # only to score candidates for beam trimming (see _extend_and_filter_batch).
+        bracket_returns_by_direction = {
+            d: _dense_bracket_returns(
+                d, ohlc["open"], ohlc["high"], ohlc["low"], ohlc["close"], self.max_hold_bars,
+                sl_tp_mode=self.sl_tp_mode, atr=ohlc.get("atr"),
+                swing_high=ohlc.get("swing_high"), swing_low=ohlc.get("swing_low"),
+                stop_loss_pct=self.stop_loss_pct, take_profit_pct=self.take_profit_pct,
+            )
+            for d in pools_by_direction
         }
 
         # Fixed canonical rank per name, assigned once (see _extend_and_filter_batch).
@@ -498,9 +740,9 @@ class ComboBacktester:
         with Progress(*progress_columns, console=console) as progress, ProcessPoolExecutor(
             max_workers=self.n_workers,
             initializer=_init_worker,
-            initargs=(pools_by_direction, ohlc, params, names_list_by_direction, name_rank_by_direction),
+            initargs=(pools_by_direction, ohlc, params, names_list_by_direction, name_rank_by_direction, bracket_returns_by_direction),
         ) as executor:
-            tasks, warm_rows, tested, cleared_prefilter, simulated_count = self._generate_tasks(
+            rows, tested, cleared_prefilter, simulated_count = self._generate_tasks(
                 pools_by_direction, names_list_by_direction, name_rank_by_direction, executor, progress, console
             )
 
@@ -512,14 +754,6 @@ class ComboBacktester:
                 "combos_cleared_min_fires": cleared_prefilter,
                 "combos_simulated": simulated_count,
             }
-
-            rows = list(warm_rows)
-            if tasks:
-                final_rows, final_simulated = self._simulate_tasks(
-                    tasks, executor, progress, "Simulating trades", console=console
-                )
-                rows.extend(final_rows)
-                self.stats["combos_simulated"] += final_simulated
 
         result = pd.DataFrame(rows)
         if not result.empty:
@@ -572,8 +806,8 @@ class ComboBacktester:
             else:
                 console.print(
                     f"  [yellow]trimmed[/yellow] {label} size-{size}: {original_count:,} combos cleared min_fires, "
-                    f"kept the {kept_count:,} built from the highest-quality conditions (by each condition's own "
-                    f"standalone total_pnl) - NOT random, but not exhaustive either at/beyond this size."
+                    f"kept the top {kept_count:,} by each combo's own bracket-aware quick score "
+                    f"(not each member's solo PnL) - NOT random, but not exhaustive either at/beyond this size."
                 )
 
         if result.empty:
@@ -590,12 +824,17 @@ class ComboBacktester:
             console.print("None were profitable under these realistic assumptions.")
             return profitable
 
-        # Full breakdown (top combos, best-per-size, top win rate, indicator diagnostics)
-        # lives in data/report.json - console stays a short summary.
-        best = profitable.iloc[0]
+        # Full breakdown of every combo lives in data/combo_results.db (query
+        # via strategy_finder.db) - console gets a "best of" table instead of
+        # a single top-PnL line, so the report doesn't imply the top-PnL combo
+        # is the only strategy worth considering (a high-winrate or
+        # better-balanced combo can be more tradeable in practice than the
+        # single highest-PnL one).
+        console.print()
+        console.print(build_best_of_table(profitable, self.min_fires))
         console.print(
-            f"\n[bold]Best combo overall:[/bold] [{best['direction']}] {best['combo']} (size {best['size']}) -> "
-            f"${self.initial_capital:.0f} became ${best['final_equity']:.2f} ({best['return_pct']:+.1f}%) "
-            f"over {best['trades']} trades, {best['win_rate_pct']:.1f}% win rate."
+            f"[dim]*Balanced Best ranks return% x win_rate% x sqrt(trades) among combos with >={self.min_fires} "
+            "trades - rewards profit and win rate together with enough trades to trust it, instead of chasing a "
+            "single extreme.[/dim]"
         )
         return profitable

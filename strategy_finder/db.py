@@ -4,7 +4,7 @@ Single source of truth for two things:
   1. Crash-safe checkpointing during a run - ComboBacktester inserts each
      batch of rows as soon as it's computed, so a crash/kill mid-run loses
      at most the last in-flight batch, not the whole search.
-  2. The Flask viewer app (webapp.py) reads straight from this database.
+  2. Ad-hoc querying of past runs' results straight from this database.
 
 Every new run starts by wiping the table (clear_results()) - only the
 latest run's results are ever kept, by design.
@@ -27,6 +27,8 @@ CREATE TABLE IF NOT EXISTS combo_results (
     fires INTEGER NOT NULL,
     trades INTEGER NOT NULL,
     win_rate_pct REAL NOT NULL,
+    avg_sl_pct REAL NOT NULL DEFAULT 0.0,
+    avg_tp_pct REAL NOT NULL DEFAULT 0.0,
     final_equity REAL NOT NULL,
     total_pnl REAL NOT NULL,
     return_pct REAL NOT NULL
@@ -37,8 +39,9 @@ CREATE INDEX IF NOT EXISTS idx_combo_results_direction ON combo_results (directi
 
 # Whitelist - never interpolate a user-supplied column name directly into SQL.
 SORTABLE_COLUMNS = {
-    "total_pnl", "return_pct", "win_rate_pct", "trades", "fires", "size", "final_equity", "id",
+    "total_pnl", "return_pct", "win_rate_pct", "trades", "fires", "size", "final_equity", "avg_sl_pct", "avg_tp_pct", "id",
 }
+
 
 
 @contextmanager
@@ -56,7 +59,15 @@ def get_connection():
 def init_db():
     with get_connection() as conn:
         conn.executescript(SCHEMA)
+        # Migration check for pre-existing databases created before avg_sl_pct/avg_tp_pct were added
+        cursor = conn.execute("PRAGMA table_info(combo_results)")
+        existing_cols = {row["name"] for row in cursor.fetchall()}
+        if "avg_sl_pct" not in existing_cols:
+            conn.execute("ALTER TABLE combo_results ADD COLUMN avg_sl_pct REAL NOT NULL DEFAULT 0.0")
+        if "avg_tp_pct" not in existing_cols:
+            conn.execute("ALTER TABLE combo_results ADD COLUMN avg_tp_pct REAL NOT NULL DEFAULT 0.0")
         conn.commit()
+
 
 
 def clear_results():
@@ -77,8 +88,8 @@ def insert_results(rows):
         conn.executemany(
             """
             INSERT INTO combo_results
-                (direction, combo, conditions, size, fires, trades, win_rate_pct, final_equity, total_pnl, return_pct)
-            VALUES (:direction, :combo, :conditions, :size, :fires, :trades, :win_rate_pct, :final_equity, :total_pnl, :return_pct)
+                (direction, combo, conditions, size, fires, trades, win_rate_pct, avg_sl_pct, avg_tp_pct, final_equity, total_pnl, return_pct)
+            VALUES (:direction, :combo, :conditions, :size, :fires, :trades, :win_rate_pct, :avg_sl_pct, :avg_tp_pct, :final_equity, :total_pnl, :return_pct)
             """,
             [
                 {
@@ -89,6 +100,8 @@ def insert_results(rows):
                     "fires": r["fires"],
                     "trades": r["trades"],
                     "win_rate_pct": r["win_rate_pct"],
+                    "avg_sl_pct": r.get("avg_sl_pct", 0.0),
+                    "avg_tp_pct": r.get("avg_tp_pct", 0.0),
                     "final_equity": r["final_equity"],
                     "total_pnl": r["total_pnl"],
                     "return_pct": r["return_pct"],
@@ -96,11 +109,12 @@ def insert_results(rows):
                 for r in rows
             ],
         )
+
         conn.commit()
 
 
 def fetch_results(direction=None, min_size=None, min_trades=None, sort_by="total_pnl", sort_dir="desc", limit=50, offset=0):
-    """Filtered/sorted/paginated read for the Flask viewer."""
+    """Filtered/sorted/paginated read of past runs' results."""
     init_db()
     sort_by = sort_by if sort_by in SORTABLE_COLUMNS else "total_pnl"
     sort_dir = "ASC" if str(sort_dir).lower() == "asc" else "DESC"
@@ -134,8 +148,11 @@ def fetch_results(direction=None, min_size=None, min_trades=None, sort_by="total
     for row in rows:
         d = dict(row)
         d["conditions"] = json.loads(d["conditions"])
+        d["avg_sl_pct"] = d.get("avg_sl_pct", 0.0) or 0.0
+        d["avg_tp_pct"] = d.get("avg_tp_pct", 0.0) or 0.0
         results.append(d)
     return results, total
+
 
 
 def get_top_combos_for_chart(limit=15):

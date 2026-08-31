@@ -3,25 +3,22 @@ exhaustively combo-backtest every indicator condition crossed with every
 price-action signal and report the top combinations by real PnL.
 """
 
-import os
 import time
-from datetime import datetime, timezone
 
 import pandas as pd
 from rich.console import Console
 from rich.table import Table
 
-from .combo_backtester import ComboBacktester
+from .combo_backtester import ComboBacktester, build_best_of_table
 from .data_fetcher import DataFetcher
 from .indicator_engine import IndicatorEngine
 from .price_action_engine import PriceActionEngine
-from .report_exporter import ReportExporter
 
 pd.set_option("display.max_columns", None)
 pd.set_option("display.width", 200)
 
 SYMBOL = "ETHUSD"
-INTERVAL = "15m"
+INTERVAL = "5m"
 TOTAL_DAYS = 365
 
 INCLUDE_INDICATORS = True
@@ -30,10 +27,15 @@ MIN_INDICATOR_BARS = 150
 
 BACKTEST_INITIAL_CAPITAL = 1000.0
 BACKTEST_RISK_PER_TRADE_PCT = 2.0
-BACKTEST_STOP_LOSS_PCT = 1  # 1% stop-loss
-BACKTEST_TAKE_PROFIT_PCT = 2  # 3% target -> 1:3 reward:risk
-BACKTEST_MAX_HOLD_BARS = 20
+BACKTEST_STOP_LOSS_PCT = 0.5  # Fixed 0.5% Stop Loss
+BACKTEST_TAKE_PROFIT_PCT = 1  # Fixed 1% Take Profit Target (1:2 risk:reward)
+BACKTEST_SL_TP_MODE = "fixed"  # Fixed %% SL/TP mode (was "atr" - fixed % needs this to take effect)
+# 3 days held constant across timeframes: 72 1h candles at INTERVAL="1h", scaled to
+# 864 5m candles here (3 * 24 * 60 / 5) - keep this in sync if INTERVAL changes again.
+BACKTEST_MAX_HOLD_BARS = 864
 BACKTEST_FEE_PCT = 0.05
+
+
 
 RUN_COMBO_BACKTEST = True
 COMBO_MIN_SIZE = 3
@@ -44,15 +46,15 @@ COMBO_MIN_FIRES = 15
 # prunes anything - size 2 already clears ~99.5% of all possible combos, size 3 ~97%,
 # so candidate counts explode combinatorially level over level with no cap (seen live:
 # size 3 -> 8.5M survivors, size 4 raw estimate -> 812M). Keeping only the top-scoring
-# (summed size-1 PnL) survivors per level bounds memory/time regardless of how
-# permissive COMBO_MIN_FIRES is - never a random cut, and reported via trimmed_levels.
-COMBO_MAX_SURVIVORS_PER_LEVEL = 200_000
+# survivors per level (each combo's own bracket-aware quick score, see
+# ComboBacktester._extend_and_filter_batch - not a sum of its members' solo PnL) bounds
+# memory/time regardless of how permissive COMBO_MIN_FIRES is - never a random cut, and
+# reported via trimmed_levels.
+COMBO_MAX_SURVIVORS_PER_LEVEL = 100000
 # Multi-candle patterns: every condition also gets a "k candles ago" copy at
 # each depth here (e.g. a big mother candle 2 bars back + inside bar 1 bar
 # back + breakout now), not just conditions that all fire on the same candle.
 COMBO_LAG_DEPTHS = (1, 2, 3)
-
-JSON_EXPORT_PATH = "data/report.json"
 
 OHLCV_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 
@@ -122,10 +124,12 @@ def main():
             risk_per_trade_pct=BACKTEST_RISK_PER_TRADE_PCT,
             stop_loss_pct=BACKTEST_STOP_LOSS_PCT,
             take_profit_pct=BACKTEST_TAKE_PROFIT_PCT,
+            sl_tp_mode=BACKTEST_SL_TP_MODE,
             max_hold_bars=BACKTEST_MAX_HOLD_BARS,
             fee_pct=BACKTEST_FEE_PCT,
             min_combo_size=COMBO_MIN_SIZE,
             max_combo_size=COMBO_MAX_SIZE,
+
             min_fires=COMBO_MIN_FIRES,
             lag_depths=COMBO_LAG_DEPTHS,
             n_workers=None,  # every CPU core minus one
@@ -137,23 +141,17 @@ def main():
         # Every combo is inserted into data/combo_results.db as it's computed
         # (see ComboBacktester.run/_simulate_tasks) - by the time this call
         # returns, results are already safely on disk regardless of what
-        # happens next. Browse them with `python3 -m strategy_finder.webapp`.
+        # happens next.
         precomputed["combo_profitable"] = combo_bt.print_report()
 
-    output_paths = []
-    try:
-        ReportExporter(df, export_config(), precomputed=precomputed).save(JSON_EXPORT_PATH)
-        output_paths.append(JSON_EXPORT_PATH)
-    except Exception as e:
-        print(f"[main] JSON report export failed ({e!r}) - combo results are still safe in data/combo_results.db.")
-
-    print_run_summary(run_start, df, precomputed, output_paths)
+    print_run_summary(run_start, df, precomputed)
 
 
-def print_run_summary(run_start, df, precomputed, output_paths):
-    """Short end-of-run summary: total time, row/column counts, where the
-    output landed. The detailed combo breakdown lives in data/report.json,
-    not the console."""
+def print_run_summary(run_start, df, precomputed):
+    """Short end-of-run summary: total time, row/column counts, best combo
+    breakdown. Every combo is already safe in data/combo_results.db by the
+    time this runs (inserted incrementally as each size finishes, see
+    ComboBacktester._generate_tasks) - no separate JSON export."""
     console = Console(width=220)
     elapsed = time.monotonic() - run_start
 
@@ -171,31 +169,13 @@ def print_run_summary(run_start, df, precomputed, output_paths):
             f"(size {best['size']}, {best['trades']} trades, {best['win_rate_pct']:.1f}% win rate)"
         )
 
-    for path in output_paths:
-        if os.path.exists(path):
-            size_mb = os.path.getsize(path) / (1024 * 1024)
-            console.print(f"Saved               : {path} ({size_mb:.1f} MB)")
-
-
-def export_config():
-    """Every setting ReportExporter needs, gathered from this module's constants."""
-    return {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "symbol": SYMBOL,
-        "interval": INTERVAL,
-        "total_days": TOTAL_DAYS,
-        "backtest_initial_capital": BACKTEST_INITIAL_CAPITAL,
-        "backtest_risk_per_trade_pct": BACKTEST_RISK_PER_TRADE_PCT,
-        "backtest_stop_loss_pct": BACKTEST_STOP_LOSS_PCT,
-        "backtest_take_profit_pct": BACKTEST_TAKE_PROFIT_PCT,
-        "backtest_max_hold_bars": BACKTEST_MAX_HOLD_BARS,
-        "backtest_fee_pct": BACKTEST_FEE_PCT,
-        "run_combo_backtest": RUN_COMBO_BACKTEST,
-        "combo_min_size": COMBO_MIN_SIZE,
-        "combo_max_size": COMBO_MAX_SIZE,
-        "combo_min_fires": COMBO_MIN_FIRES,
-        "combo_lag_depths": list(COMBO_LAG_DEPTHS),
-    }
+        console.print()
+        console.print(build_best_of_table(profitable, COMBO_MIN_FIRES))
+        console.print(
+            f"[dim]*Balanced Best ranks return% x win_rate% x sqrt(trades) among combos with >={COMBO_MIN_FIRES} "
+            "trades - rewards profit and win rate together with enough trades to trust it, instead of chasing a "
+            "single extreme.[/dim]"
+        )
 
 
 if __name__ == "__main__":
