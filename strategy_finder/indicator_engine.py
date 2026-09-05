@@ -3,6 +3,7 @@
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
+from numpy.lib.stride_tricks import sliding_window_view
 from scipy import stats
 
 
@@ -27,6 +28,8 @@ class IndicatorEngine:
             ("advanced trend features", self._add_advanced_trend_features),
             ("information theory features", self._add_information_theory_features),
             ("microstructure features", self._add_microstructure_features),
+            ("spectral (FFT) features", self._add_spectral_features),
+            ("quant regime features", self._add_quant_regime_features),
             ("interaction features", self._add_interaction_features),
         ]
 
@@ -276,6 +279,160 @@ class IndicatorEngine:
         new_features["slippage_proxy"] = (df["High"] - df["Low"]) / df["Close"].rolling(10).mean()
         new_features["stop_hunt_proxy"] = (df["High"] - df["Low"]) / (df["ATR_14"] + 0.0001)
         # amihud_illiquidity dropped: never a useful condition.
+
+        self.df = pd.concat([df, new_features], axis=1)
+
+    # ------------------------------------------------------------------
+    # Spectral (FFT) features
+    #
+    # Every rolling window is transformed in ONE batched numpy FFT call
+    # (np.fft.rfft/irfft operate along the last axis of a 2D array of
+    # windows at once) instead of a per-row Python loop - the same trick
+    # simulate_trades() uses for its bracket touch/exit windows.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _rolling_spectrum(returns, window):
+        """FFT power spectrum of every trailing `window`-bar slice of
+        `returns` (demeaned + Hann-tapered per window to reduce spectral
+        leakage - standard practice since these windows are analyzed for
+        their power distribution, not reconstructed back to a value).
+        Returns (power_no_dc, freq_bins) where power_no_dc excludes the
+        zero-frequency (DC/mean) bin - that bin just reflects the window's
+        average return, not any cyclical structure, and would otherwise
+        dominate the "dominant frequency" pick on trending windows."""
+        n = len(returns)
+        if n < window:
+            return None, 0
+        windows = sliding_window_view(returns, window)
+        windows = windows - windows.mean(axis=1, keepdims=True)
+        windows = windows * np.hanning(window)[None, :]
+        spectrum = np.fft.rfft(windows, axis=1)
+        power = np.abs(spectrum) ** 2
+        return power[:, 1:], power.shape[1] - 1
+
+    def _rolling_fft_trend(self, price, window, keep_harmonics=3):
+        """Causal FFT low-pass reconstruction: per trailing window, fit and
+        remove the window's own linear trend (so the FFT isn't fooled by
+        the sharp jump between a trending window's start and end - FFT
+        implicitly treats the window as periodic, and that jump would
+        otherwise leak into every frequency bin as spurious high-frequency
+        content, i.e. ringing right at the edge we actually care about),
+        zero out all but the lowest `keep_harmonics` frequencies of the
+        now-detrended residual, inverse-FFT, add the trend back, and keep
+        only the LAST point of each window - the current bar's FFT-smoothed
+        trend value, comparable to an EMA/SMA but built from the window's
+        own frequency content instead of a fixed decay shape."""
+        n = len(price)
+        if n < window:
+            return np.full(n, np.nan)
+        windows = sliding_window_view(price, window).astype(np.float64)
+        x = np.arange(window, dtype=np.float64)
+        x_centered = x - x.mean()
+        denom = (x_centered**2).sum()
+
+        y_mean = windows.mean(axis=1, keepdims=True)
+        slope = (windows * x_centered[None, :]).sum(axis=1, keepdims=True) / denom
+        intercept = y_mean - slope * x.mean()
+        trend = slope * x[None, :] + intercept
+        residual = windows - trend
+
+        spectrum = np.fft.rfft(residual, axis=1)
+        spectrum[:, keep_harmonics:] = 0
+        reconstructed = np.fft.irfft(spectrum, n=window, axis=1) + trend
+        return np.concatenate([np.full(window - 1, np.nan), reconstructed[:, -1]])
+
+    def _add_spectral_features(self, window=32):
+        df = self.df
+        new_features = pd.DataFrame(index=df.index)
+
+        power_no_dc, n_bins = self._rolling_spectrum(df["return_1"].fillna(0).to_numpy(), window)
+        pad = window - 1
+        if power_no_dc is None:
+            for col in ["fft_dominant_cycle", "fft_dominant_power_ratio", "fft_spectral_entropy", "fft_low_freq_power_ratio"]:
+                new_features[col] = np.nan
+        else:
+            total_power = power_no_dc.sum(axis=1) + 1e-12
+            dominant_bin = np.argmax(power_no_dc, axis=1) + 1  # +1: bin index in the original (DC-included) spectrum
+            dominant_power = power_no_dc[np.arange(len(power_no_dc)), dominant_bin - 1]
+
+            p = power_no_dc / total_power[:, None]
+            spectral_entropy = -np.sum(p * np.log(p + 1e-12), axis=1) / np.log(n_bins)
+
+            low_cut = max(1, n_bins // 4)
+            low_freq_ratio = power_no_dc[:, :low_cut].sum(axis=1) / total_power
+
+            new_features["fft_dominant_cycle"] = np.concatenate([np.full(pad, np.nan), window / dominant_bin])
+            new_features["fft_dominant_power_ratio"] = np.concatenate([np.full(pad, np.nan), dominant_power / total_power])
+            new_features["fft_spectral_entropy"] = np.concatenate([np.full(pad, np.nan), spectral_entropy])
+            new_features["fft_low_freq_power_ratio"] = np.concatenate([np.full(pad, np.nan), low_freq_ratio])
+
+        fft_trend = self._rolling_fft_trend(df["Close"].to_numpy(), window)
+        new_features["price_to_fft_trend"] = (df["Close"].to_numpy() - fft_trend) / fft_trend
+
+        self.df = pd.concat([df, new_features], axis=1)
+
+    # ------------------------------------------------------------------
+    # Quant regime features: trending-vs-mean-reverting classifiers used in
+    # stat-arb / systematic trading, none of them specific to any one asset.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _hurst_exponent(x, n_lags=8):
+        """Generalized Hurst exponent via the variance-lag method (Di Matteo
+        et al.): for fractional Brownian motion, std(x[t+lag]-x[t]) scales as
+        lag^H, so H is the slope of log(std(diff)) vs log(lag). H > 0.5 =
+        trending/persistent, H < 0.5 = mean-reverting, H ~= 0.5 = random walk.
+        Cheaper and more stable on short windows than classical rescaled-range
+        (R/S) analysis, at the cost of being a rougher estimate."""
+        n = len(x)
+        if n < 20 or np.all(x == x[0]):
+            return np.nan
+        lags = np.unique(np.floor(np.logspace(np.log10(2), np.log10(max(3, n // 2)), num=n_lags)).astype(int))
+        lags = lags[lags >= 2]
+        if len(lags) < 2:
+            return np.nan
+        tau = np.array([np.std(x[lag:] - x[:-lag]) for lag in lags])
+        valid = tau > 0
+        if valid.sum() < 2:
+            return np.nan
+        slope, _intercept, _r, _p, _se = stats.linregress(np.log(lags[valid]), np.log(tau[valid]))
+        return slope
+
+    def _add_quant_regime_features(self, hurst_window=64, ou_window=30, fisher_window=10):
+        df = self.df
+        new_features = pd.DataFrame(index=df.index)
+
+        # Hurst exponent: no closed-form rolling formula (needs a per-window
+        # multi-lag fit), so this is a rolling-apply like price_entropy/
+        # dir_entropy above - same accepted cost profile as those.
+        new_features["hurst_exponent"] = df["Close"].rolling(hurst_window).apply(self._hurst_exponent, raw=True)
+
+        # Ornstein-Uhlenbeck mean-reversion speed: rolling AR(1) regression of
+        # Close[t]-Close[t-1] on Close[t-1] (pandas' rolling .cov()/.var() are
+        # themselves vectorized, no python loop). lambda < 0 = mean-reverting
+        # (more negative = faster reversion), lambda > 0 = trending/momentum.
+        lag = df["Close"].shift(1)
+        diff = df["Close"].diff()
+        roll_cov = lag.rolling(ou_window).cov(diff)
+        roll_var = lag.rolling(ou_window).var()
+        ou_lambda = roll_cov / (roll_var + 1e-9)
+        new_features["ou_lambda"] = ou_lambda
+        # Half-life in bars if mean-reverting, hard-capped at 500 (not just
+        # gated on lambda's sign - a lambda barely below zero gives a huge
+        # half-life too) so this stays bounded instead of leaving NaN/inf
+        # for downstream code to trip over, consistent with this file's
+        # epsilon-guard convention.
+        raw_half_life = np.where(ou_lambda < -1e-8, -np.log(2) / ou_lambda, 500.0)
+        new_features["ou_half_life"] = np.minimum(raw_half_life, 500.0)
+
+        # Fisher Transform (Ehlers): maps price's position within its recent
+        # range through an inverse-hyperbolic-tangent-shaped curve, sharpening
+        # turning points into more extreme, more clearly-separated values than
+        # the raw stochastic-style position itself.
+        llv = df["Low"].rolling(fisher_window).min()
+        hhv = df["High"].rolling(fisher_window).max()
+        raw_value = (2 * ((df["Close"] - llv) / (hhv - llv + 1e-9) - 0.5)).clip(-0.999, 0.999)
+        fisher = 0.5 * np.log((1 + raw_value) / (1 - raw_value))
+        new_features["fisher_transform"] = fisher.ewm(span=3, adjust=False).mean()
 
         self.df = pd.concat([df, new_features], axis=1)
 
